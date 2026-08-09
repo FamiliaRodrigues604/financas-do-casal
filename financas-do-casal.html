@@ -280,6 +280,7 @@
   let yearSel = null;           // 'YYYY' — ano exibido no Panorama Anual
   let txCatFilter = null;       // categoria ativa ao clicar num gráfico ('Mercado', 'Saúde'...)
   let txKindFilter = null;      // natureza ativa ao clicar em Composição das despesas ('fixa'|'variavel'|'parcela')
+  let txBucketFilter = null;    // bucket de fluxo de caixa ativo ('fixa'|'variavel'|'cartaoMes'|'fatura')
 
   let CAT_OUT = ["Mercado","Fruteira","Gasolina","Farmácia","Lazer","Restaurante","Padaria","Lanches","Roupas e outros","Casa","Casa Sitio","Academia","Cuidados pessoais","Produto Mega Hair","Pet","Mercado Livre","Shopee","NetFlix","Assinaturas","Cursos","Celular","Uber","Pedagio","Lavar carro","Seguro carro","Manutenção","Material escolar","Uniforme","Vacina","Sesi","Artesanato","Jogo","Airbnb","Impressão","Serviços","Serviços cartorio","Presente","Débitos","Rotativo","Avila","A revisar","Outros"];
   let CAT_IN  = ["Salário","Barbearia","Gelateria","Aluguel","Investimentos","Estorno","Presente","Outros"];
@@ -328,6 +329,42 @@
   const GROUP_LABEL = {receita:'Receitas', fixa:'Fixas', importada:'Importadas do cartão', avulsa:'Lançamentos do mês'};
   const GROUP_ICON  = {receita:'💰', fixa:'🔁', importada:'💳', avulsa:'🧾'};
 
+  // ---- Buckets de fluxo de caixa: Fixas / Variáveis / Variáveis no cartão / Fatura mês anterior ----
+  // Independem da lente global (competência/caixa): usam sempre data real da compra × mês em que a fatura vence.
+  function isCardTx(t){
+    if(t.card===true) return true;
+    if(t.card===false) return false;
+    return !!t.imp; // itens importados de fatura são cartão por padrão, salvo marcação explícita em contrário
+  }
+  function purchaseYM(t){ return (t.date||'').slice(0,7); }
+  function dueYM(t){ return t.comp || purchaseYM(t); }
+
+  // a que bucket uma despesa pertence, na natureza (o mês exato é resolvido em txBucketsForMonth)
+  function payBucket(t){
+    if(t.type!=='out') return null;
+    if(t.fixedId) return 'fixa';
+    if(txKind(t)==='parcela') return 'fatura'; // parcelas de dívida do cartão ficam junto da fatura do mês em que vencem
+    if(isCardTx(t)) return 'cartao';
+    return 'variavel';
+  }
+
+  function txBucketsForMonth(ym){
+    const b = {fixa:[], variavel:[], cartaoMes:[], fatura:[]};
+    State.tx.forEach(t=>{
+      const k = payBucket(t); if(!k) return;
+      if(k==='fixa'){ if(purchaseYM(t)===ym) b.fixa.push(t); return; }
+      if(k==='variavel'){ if(purchaseYM(t)===ym) b.variavel.push(t); return; }
+      if(k==='fatura'){ if(dueYM(t)===ym) b.fatura.push(t); return; }
+      if(k==='cartao'){
+        if(dueYM(t)===ym) b.fatura.push(t);              // compra de outro mês, fatura vence agora
+        else if(purchaseYM(t)===ym) b.cartaoMes.push(t);  // comprado este mês, ainda não venceu
+      }
+    });
+    return b;
+  }
+  const BUCKET_LABEL = {fixa:'Fixas', variavel:'Variáveis', cartaoMes:'Variáveis no cartão', fatura:'Fatura mês anterior'};
+  const BUCKET_ICON  = {fixa:'🔁', variavel:'🛒', cartaoMes:'💳', fatura:'🧾'};
+
   /* navegação por clique nos gráficos/composição */
   function goToCategoryTx(cat){
     txCatFilter = cat; txKindFilter = null; txFilter='out';
@@ -336,12 +373,18 @@
     const sec=document.getElementById('sec-tx'); if(sec) sec.scrollIntoView({behavior:'smooth', block:'start'});
   }
   function goToKindTx(kind){
-    txKindFilter = kind; txCatFilter = null; txFilter='out';
+    txKindFilter = kind; txCatFilter = null; txBucketFilter = null; txFilter='out';
     renderAll();
     const btn=document.querySelector('#tabs button[data-tab="tx"]'); if(btn) switchTab('tx', btn);
     const sec=document.getElementById('sec-tx'); if(sec) sec.scrollIntoView({behavior:'smooth', block:'start'});
   }
-  function clearTxFilters(){ txCatFilter=null; txKindFilter=null; renderTx(); }
+  function goToBucketTx(bucket){
+    txBucketFilter = bucket; txKindFilter = null; txCatFilter = null; txFilter='out';
+    renderAll();
+    const btn=document.querySelector('#tabs button[data-tab="tx"]'); if(btn) switchTab('tx', btn);
+    const sec=document.getElementById('sec-tx'); if(sec) sec.scrollIntoView({behavior:'smooth', block:'start'});
+  }
+  function clearTxFilters(){ txCatFilter=null; txKindFilter=null; txBucketFilter=null; renderTx(); }
   function wireDonutClicks(root){
     if(!root) return;
     root.querySelectorAll('[data-cat]').forEach(el=> el.onclick=()=> goToCategoryTx(el.dataset.cat));
@@ -500,21 +543,28 @@
       </div>
 
       ${(()=>{
-        const outs=list.filter(t=>t.type==='out');
-        const fixK=sum(outs.filter(t=>txKind(t)==='fixa').map(t=>t.amount));
-        const parK=sum(outs.filter(t=>txKind(t)==='parcela').map(t=>t.amount));
-        const varK=sum(outs.filter(t=>txKind(t)==='variavel').map(t=>t.amount));
-        const tot=fixK+parK+varK; if(tot===0) return '';
-        const row=(lbl,val,color,note,kind)=>`<div class="budline clickable" data-kind="${kind}" title="Ver lançamentos desta natureza">
+        const buckets = txBucketsForMonth(month);
+        const fixK = sum(buckets.fixa.map(t=>t.amount));
+        const varK = sum(buckets.variavel.map(t=>t.amount));
+        const cardK = sum(buckets.cartaoMes.map(t=>t.amount));
+        const fatK = sum(buckets.fatura.map(t=>t.amount));
+        const tot = fixK+varK+cardK+fatK; if(tot===0) return '';
+        const totalPagar = fixK+varK+fatK;
+        const row=(lbl,val,color,note,bucket)=>`<div class="budline clickable" data-bucket="${bucket}" title="Ver lançamentos deste grupo">
           <div class="head"><span class="nm">${lbl}</span><span class="num"><b>${fmt(val)}</b> · ${Math.round(val/tot*100)}%</span></div>
           <div class="bar"><span style="width:${val/tot*100}%;background:${color}"></span></div>
           <div class="num" style="margin-top:5px">${note}</div></div>`;
         return `<div class="card" style="margin-bottom:16px">
           <h3>🧱 Composição das despesas — ${monthLabel(month)}</h3>
-          <div class="desc" style="margin-bottom:8px">Separadas por natureza. Parcelas são <b>pagamento de dívida</b> (compras passadas), não gasto fixo nem novo. Clique numa linha para ver os lançamentos.</div>
-          ${row('🔁 Fixas (recorrentes)', fixK, 'var(--forest)', 'aluguel, escola, seguros, assinaturas…', 'fixa')}
-          ${row('🛒 Variáveis (do mês)', varK, 'var(--gold)', 'mercado, gasolina, lazer, farmácia…', 'variavel')}
-          ${row('💳 Parcelas (dívida do cartão)', parK, 'var(--coral)', 'compras parceladas que estão sendo quitadas', 'parcela')}
+          <div class="desc" style="margin-bottom:8px">Fixas para pagar este mês, variáveis do dia a dia, o que já foi gasto no cartão (e só vira fatura mês que vem) e a fatura deste mês (compras/parcelas de meses anteriores). Clique numa linha para ver os lançamentos.</div>
+          ${row('🔁 Fixas', fixK, 'var(--forest)', 'aluguel, escola, seguros, assinaturas… a pagar este mês', 'fixa')}
+          ${row('🛒 Variáveis', varK, 'var(--gold)', 'compras do mês em dinheiro, pix ou débito', 'variavel')}
+          ${row('💳 Variáveis no cartão', cardK, '#a98be0', 'compras deste mês no cartão — ainda não vencem, cairão na fatura do mês que vem', 'cartaoMes')}
+          ${row('🧾 Fatura mês anterior', fatK, 'var(--coral)', 'fatura do cartão que vence agora: compras de meses passados + parcelas', 'fatura')}
+          <div class="budline" style="border-top:2px solid var(--line);margin-top:4px;padding-top:12px">
+            <div class="head"><span class="nm">💵 Total que sai do bolso este mês</span><span class="num"><b>${fmt(totalPagar)}</b></span></div>
+            <div class="num" style="margin-top:2px">Fixas + Variáveis + Fatura mês anterior (não inclui o que já foi gasto no cartão este mês — isso só vira conta a pagar no mês que vem)</div>
+          </div>
         </div>`;
       })()}
 
@@ -536,6 +586,7 @@
     const dashSec=document.getElementById('sec-dash');
     wireDonutClicks(dashSec);
     dashSec.querySelectorAll('.budline[data-kind]').forEach(el=> el.onclick=()=> goToKindTx(el.dataset.kind));
+    dashSec.querySelectorAll('.budline[data-bucket]').forEach(el=> el.onclick=()=> goToBucketTx(el.dataset.bucket));
   }
 
   function donut(cats, total, clickable){
@@ -574,10 +625,13 @@
   function renderTx(){
     const sec=document.getElementById('sec-tx');
     const opts=(arr)=>arr.map(c=>`<option value="${c}">${c}</option>`).join("");
-    let list = txOfMonth(month).slice().sort((a,b)=> (b.date||"").localeCompare(a.date||""));
-    if(txFilter!=='all') list=list.filter(t=>t.type===txFilter);
-    if(txCatFilter) list=list.filter(t=>t.cat===txCatFilter);
-    if(txKindFilter) list=list.filter(t=>txKind(t)===txKindFilter);
+    let list = (txBucketFilter ? txBucketsForMonth(month)[txBucketFilter].slice() : txOfMonth(month).slice())
+      .sort((a,b)=> (b.date||"").localeCompare(a.date||""));
+    if(!txBucketFilter){
+      if(txFilter!=='all') list=list.filter(t=>t.type===txFilter);
+      if(txCatFilter) list=list.filter(t=>t.cat===txCatFilter);
+      if(txKindFilter) list=list.filter(t=>txKind(t)===txKindFilter);
+    }
     const dd = month+'-'+String(Math.min(new Date().getDate(),28)).padStart(2,'0');
     const outL = txOfMonth(month).filter(t=>t.type==='out');
     let pieHtml='';
@@ -587,6 +641,7 @@
     let filterBanner='';
     if(txCatFilter) filterBanner=`<div class="activefilter">Mostrando lançamentos de <b>${CAT_ICON[txCatFilter]||'•'} ${esc(txCatFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
     else if(txKindFilter) filterBanner=`<div class="activefilter">Mostrando <b>${esc(KIND_LABEL[txKindFilter]||txKindFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
+    else if(txBucketFilter) filterBanner=`<div class="activefilter">Mostrando <b>${BUCKET_ICON[txBucketFilter]||''} ${esc(BUCKET_LABEL[txBucketFilter]||txBucketFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
 
     // separa a lista em grupos por origem: receitas, fixas, importadas do cartão, avulsas do mês
     const groupOrder=['receita','fixa','importada','avulsa'];
@@ -612,6 +667,8 @@
           <div class="field" style="flex:0 0 140px"><label>Categoria</label><select id="txCat">${opts(CAT_OUT)}</select></div>
           <div class="field" style="flex:0 0 130px"><label>Quem</label>
             <select id="txWho"><option value="ambos">Ambos</option><option value="a">${esc(State.profile.a)}</option><option value="b">${esc(State.profile.b)}</option></select></div>
+          <div class="field" style="flex:0 0 150px"><label>Forma de pagamento</label>
+            <select id="txPay"><option value="cash">Dinheiro / Pix / Débito</option><option value="card">Cartão de crédito</option></select></div>
           <div class="field" style="flex:0 0 135px"><label>Data</label><input id="txDate" type="date" value="${dd}"></div>
           <div class="field" style="flex:0 0 135px"><label>Vencimento</label><input id="txDue" type="date"></div>
           <div class="field" style="flex:0 0 100px"><label>Parcelas</label><input id="txParc" type="number" min="1" step="1" value="1"></div>
@@ -637,7 +694,7 @@
 
       <div class="card">
         ${list.length? `<div class="list">`+listHtml+`</div>`
-        : `<div class="empty"><div class="big">📝</div>Nenhum lançamento${(txCatFilter||txKindFilter)?' com esse filtro':''} em ${monthLabel(month)}. ${(txCatFilter||txKindFilter)?'':'Comece adicionando acima.'}</div>`}
+        : `<div class="empty"><div class="big">📝</div>Nenhum lançamento${(txCatFilter||txKindFilter||txBucketFilter)?' com esse filtro':''} em ${monthLabel(month)}. ${(txCatFilter||txKindFilter||txBucketFilter)?'':'Comece adicionando acima.'}</div>`}
       </div>
       <div id="catManagerCard">${catManagerHtml()}</div>`;
 
@@ -667,7 +724,7 @@
     return `<div class="row">
       <div class="dot ${t.type==='in'?'in':'out'}">${CAT_ICON[t.cat]||(t.type==='in'?'↑':'↓')}</div>
       <div class="meta"><div class="t">${esc(t.desc||t.cat)}</div>
-        <div class="s">${ds} · <span class="tag">${esc(t.cat)}</span> · ${esc(who)}${t.fixedId?' · <span class="tag" style="background:var(--mint);color:var(--forest)">fixa</span>':''}${txKind(t)==='parcela'?' · <span class="tag" style="background:var(--coral-soft);color:var(--coral)">parcela</span>':''}${dueTxt}</div></div>
+        <div class="s">${ds} · <span class="tag">${esc(t.cat)}</span> · ${esc(who)}${t.fixedId?' · <span class="tag" style="background:var(--mint);color:var(--forest)">fixa</span>':''}${txKind(t)==='parcela'?' · <span class="tag" style="background:var(--coral-soft);color:var(--coral)">parcela</span>':''}${(!t.fixedId && t.type==='out' && txKind(t)!=='parcela' && isCardTx(t))?' · <span class="tag" style="background:#ece3fb;color:#6a4bb8">cartão</span>':''}${dueTxt}</div></div>
       <div class="amt ${t.type==='in'?'in':'out'}">${t.type==='in'?'+':'−'} ${fmtShort(t.amount)}</div>
       <button class="x" data-edit="${t.id}" title="Editar">✎</button>
       <button class="x" data-del="${t.id}" title="Remover">✕</button>
@@ -677,6 +734,7 @@
   function editRowHtml(t){
     const cats=(t.type==='in'?CAT_IN:CAT_OUT).map(c=>`<option ${c===t.cat?'selected':''}>${c}</option>`).join("");
     const comp = t.comp || (t.date||'').slice(0,7);
+    const cardVal = t.card===true?'card':(t.card===false?'cash':'auto');
     return `<div style="border:1px solid var(--forest);border-radius:12px;padding:14px;margin:6px 0;background:var(--mint)">
       <div class="formrow">
         <div class="field" style="flex:0 0 120px"><label>Tipo</label>
@@ -688,9 +746,11 @@
       <div class="formrow" style="margin-top:10px">
         <div class="field" style="flex:0 0 135px"><label>Quem</label>
           <select id="eWho"><option value="ambos" ${(!t.who||t.who==='ambos')?'selected':''}>Ambos</option><option value="a" ${t.who==='a'?'selected':''}>${esc(State.profile.a)}</option><option value="b" ${t.who==='b'?'selected':''}>${esc(State.profile.b)}</option></select></div>
+        <div class="field" style="flex:0 0 150px"><label>Forma de pagamento</label>
+          <select id="eCard"><option value="auto" ${cardVal==='auto'?'selected':''}>Automático (pela origem)</option><option value="cash" ${cardVal==='cash'?'selected':''}>Dinheiro / Pix / Débito</option><option value="card" ${cardVal==='card'?'selected':''}>Cartão de crédito</option></select></div>
         <div class="field" style="flex:0 0 140px"><label>Data</label><input id="eDate" type="date" value="${t.date||''}"></div>
         <div class="field" style="flex:0 0 140px"><label>Vencimento</label><input id="eDue" type="date" value="${t.due||''}"></div>
-        <div class="field" style="flex:0 0 150px"><label>Mês (competência)</label><input id="eComp" type="month" value="${comp}"></div>
+        <div class="field" style="flex:0 0 150px"><label>Mês da fatura (caixa)</label><input id="eComp" type="month" value="${comp}"></div>
         <div class="field" style="flex:0 0 auto;align-self:flex-end;display:flex;gap:8px">
           <button class="btn sm" id="eSave">Salvar</button>
           <button class="btn ghost sm" id="eCancel">Cancelar</button>
@@ -709,13 +769,18 @@
     const dueVal=g('txDue').value||"";
     const parc=Math.max(1, parseInt(g('txParc').value)||1);
     const asDebt=g('txAsDebt').checked;
+    const payEl=g('txPay');
+    const isCard = type==='out' && payEl && payEl.value==='card';
     if(parc===1){
-      State.tx.push({ id:uid(), type, amount, cat, who, date:baseDate, desc, due:dueVal||undefined });
+      // compra única no cartão: a compra conta neste mês, mas a fatura só vence no mês seguinte
+      const comp = isCard ? addMonthsISO(baseDate,1).slice(0,7) : undefined;
+      State.tx.push({ id:uid(), type, amount, cat, who, date:baseDate, desc, due:dueVal||undefined, card:isCard||undefined, comp });
     } else {
       for(let i=0;i<parc;i++){
         State.tx.push({ id:uid(), type, amount, cat, who,
           date:addMonthsISO(baseDate,i),
           due: dueVal?addMonthsISO(dueVal,i):undefined,
+          card:isCard||undefined,
           desc:(desc||cat)+` - Parcela ${i+1}/${parc}` });
       }
       if(asDebt && type==='out'){
@@ -736,6 +801,8 @@
     t.who=g('eWho').value; t.date=g('eDate').value||t.date; t.due=g('eDue').value||undefined;
     const comp=g('eComp').value;
     t.comp = (comp && comp!==(t.date||'').slice(0,7)) ? comp : undefined;
+    const cardSel=g('eCard').value;
+    t.card = cardSel==='card' ? true : (cardSel==='cash' ? false : undefined);
     editingTxId=null;
     save('tx', State.tx);
     renderAll();
