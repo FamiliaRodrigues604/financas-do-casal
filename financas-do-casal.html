@@ -281,9 +281,11 @@
   let txCatFilter = null;       // categoria ativa ao clicar num gráfico ('Mercado', 'Saúde'...)
   let txKindFilter = null;      // natureza ativa ao clicar em Composição das despesas ('fixa'|'variavel'|'parcela')
   let txBucketFilter = null;    // bucket de fluxo de caixa ativo ('fixa'|'variavel'|'cartaoMes'|'fatura')
+  let txValueSort = null;       // ordenação por valor no grupo "Compras no cartão": null (data) | 'desc' (maior→menor) | 'asc' (menor→maior)
 
   let CAT_OUT = ["Mercado","Fruteira","Gasolina","Farmácia","Lazer","Restaurante","Padaria","Lanches","Roupas e outros","Casa","Casa Sitio","Academia","Cuidados pessoais","Produto Mega Hair","Pet","Mercado Livre","Shopee","NetFlix","Assinaturas","Cursos","Celular","Uber","Pedagio","Lavar carro","Seguro carro","Manutenção","Material escolar","Uniforme","Vacina","Sesi","Artesanato","Jogo","Airbnb","Impressão","Serviços","Serviços cartorio","Presente","Débitos","Rotativo","Avila","A revisar","Outros"];
   let CAT_IN  = ["Salário","Barbearia","Gelateria","Aluguel","Investimentos","Estorno","Presente","Outros"];
+  ptSort(CAT_OUT); ptSort(CAT_IN); // categorias sempre em ordem alfabética
   const CAT_ICON = {Mercado:"🛒",Fruteira:"🍎",Gasolina:"⛽",Farmácia:"➕",Lazer:"🎬",Restaurante:"🍽️",Padaria:"🥐",Lanches:"🍫",["Roupas e outros"]:"👕",Casa:"🏠",["Casa Sitio"]:"🌳",Academia:"🏋️",["Cuidados pessoais"]:"💇",["Produto Mega Hair"]:"💈",Pet:"🐾",["Mercado Livre"]:"📦",Shopee:"🛍️",NetFlix:"📺",Assinaturas:"🔄",Cursos:"📚",Celular:"📱",Uber:"🚗",Pedagio:"🛣️",["Lavar carro"]:"🧽",["Seguro carro"]:"🛡️",Manutenção:"🔧",["Material escolar"]:"✏️",Uniforme:"👔",Vacina:"💉",Sesi:"🏫",Artesanato:"🎨",Jogo:"🎮",Airbnb:"🏨",Impressão:"🖨️",Serviços:"🧰",["Serviços cartorio"]:"📜",Presente:"🎁",Débitos:"💳",Rotativo:"♻️",Avila:"•",["A revisar"]:"❓",Outros:"•",Salário:"💼",Barbearia:"💈",Gelateria:"🍦",Aluguel:"🏘️",Investimentos:"📈",Estorno:"↩️"};
   Object.assign(CAT_ICON,{"Dízimo":"⛪","Moradia":"🏢","Saúde":"🩺","Escola":"🎒"});
   const PALETTE = ["#2f5d50","#bd8b3c","#c0563f","#5b8a72","#7a6cae","#3f7a8a","#a8743f","#94794a","#b85c7e","#56707d"];
@@ -297,6 +299,7 @@
   function todayISO(){ return new Date().toISOString().slice(0,10); }
   function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
   function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
+  function ptSort(arr){ arr.sort((a,b)=> a.localeCompare(b,'pt-BR',{sensitivity:'base'})); return arr; }
   function txOfMonth(ym){
     if(lens==='caixa') return State.tx.filter(t=> (t.comp || (t.date||"").slice(0,7))===ym);
     // competência (mês da compra): agrupa pela data real, ignora o mês de pagamento
@@ -323,10 +326,12 @@
   function txGroup(t){
     if(t.type!=='out') return 'receita';
     if(t.fixedId) return 'fixa';
-    if(t.imp || String(t.id||'').indexOf('seed')===0) return 'importada';
+    // usa a forma de pagamento real (respeitando edição manual do usuário), não só a origem do lançamento —
+    // assim, ao editar "Forma de pagamento" de um item, ele muda de grupo automaticamente.
+    if(isCardTx(t)) return 'importada';
     return 'avulsa';
   }
-  const GROUP_LABEL = {receita:'Receitas', fixa:'Fixas', importada:'Importadas do cartão', avulsa:'Lançamentos do mês'};
+  const GROUP_LABEL = {receita:'Receitas', fixa:'Fixas', importada:'Compras no cartão', avulsa:'Lançamentos do mês'};
   const GROUP_ICON  = {receita:'💰', fixa:'🔁', importada:'💳', avulsa:'🧾'};
 
   // ---- Buckets de fluxo de caixa: Fixas / Variáveis / Variáveis no cartão / Fatura mês anterior ----
@@ -334,7 +339,8 @@
   function isCardTx(t){
     if(t.card===true) return true;
     if(t.card===false) return false;
-    return !!t.imp; // itens importados de fatura são cartão por padrão, salvo marcação explícita em contrário
+    if(String(t.id||'').indexOf('seed')===0) return true; // seeds antigos (fatura Nubank) continuam cartão por padrão
+    return !!t.imp && t.source!=='account'; // importado da fatura do cartão = cartão; importado de extrato de conta = não é cartão, salvo marcação explícita
   }
   function purchaseYM(t){ return (t.date||'').slice(0,7); }
   function dueYM(t){ return t.comp || purchaseYM(t); }
@@ -643,14 +649,20 @@
     else if(txKindFilter) filterBanner=`<div class="activefilter">Mostrando <b>${esc(KIND_LABEL[txKindFilter]||txKindFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
     else if(txBucketFilter) filterBanner=`<div class="activefilter">Mostrando <b>${BUCKET_ICON[txBucketFilter]||''} ${esc(BUCKET_LABEL[txBucketFilter]||txBucketFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
 
-    // separa a lista em grupos por origem: receitas, fixas, importadas do cartão, avulsas do mês
+    // separa a lista em grupos por origem: receitas, fixas, compras no cartão, avulsas do mês
     const groupOrder=['receita','fixa','importada','avulsa'];
     const groups={receita:[],fixa:[],importada:[],avulsa:[]};
     list.forEach(t=> groups[txGroup(t)].push(t));
     const listHtml = groupOrder.map(g=>{
       const arr=groups[g]; if(!arr.length) return '';
+      if(g==='importada' && txValueSort) arr.sort((a,b)=> txValueSort==='desc' ? b.amount-a.amount : a.amount-b.amount);
       const rows=arr.map(t=> t.id===editingTxId ? editRowHtml(t) : viewRowHtml(t)).join("");
-      return `<div class="txgroup-head">${GROUP_ICON[g]} ${GROUP_LABEL[g]} <span class="cnt">${arr.length}</span></div>${rows}`;
+      const sortCtl = g==='importada' ? `
+        <span class="valuesort" id="valueSortBtn" title="Ordenar por valor" style="margin-left:auto;cursor:pointer;font-weight:400;font-size:12.5px;color:var(--ink-soft);user-select:none">
+          Valor (R$) ${txValueSort==='desc'?'▼':txValueSort==='asc'?'▲':'⇅'}
+        </span>
+        <button type="button" class="btn ghost sm" id="bulkMarkCash" data-ids="${arr.map(t=>t.id).join(',')}" style="margin-left:10px;font-weight:400;font-size:12px;padding:3px 9px">Marcar tudo como Dinheiro/Pix</button>` : '';
+      return `<div class="txgroup-head" style="display:flex;align-items:center">${GROUP_ICON[g]} ${GROUP_LABEL[g]} <span class="cnt">${arr.length}</span>${sortCtl}</div>${rows}`;
     }).join("");
 
     sec.innerHTML = `
@@ -703,6 +715,20 @@
     sec.querySelector('#txAdd').onclick=addTx;
     const gm=sec.querySelector('#gotoCatMgr'); if(gm) gm.onclick=()=> document.getElementById('catManagerCard').scrollIntoView({behavior:'smooth', block:'start'});
     const cf=sec.querySelector('#clearFilt'); if(cf) cf.onclick=clearTxFilters;
+    const vs=sec.querySelector('#valueSortBtn'); if(vs) vs.onclick=()=>{ txValueSort = txValueSort===null?'desc':(txValueSort==='desc'?'asc':null); renderTx(); };
+    sec.querySelectorAll('[data-toggle-card]').forEach(el=> el.onclick=(ev)=>{
+      ev.stopPropagation();
+      const t=State.tx.find(x=>x.id===el.dataset.toggleCard); if(!t) return;
+      t.card = isCardTx(t) ? false : true;
+      save('tx', State.tx); renderAll();
+    });
+    const bm=sec.querySelector('#bulkMarkCash'); if(bm) bm.onclick=()=>{
+      const ids=(bm.dataset.ids||'').split(',').filter(Boolean);
+      if(!ids.length) return;
+      if(!confirm(`Marcar os ${ids.length} lançamentos visíveis em "Compras no cartão" como Dinheiro/Pix/Débito? Você pode remarcar como cartão depois, um a um, clicando na etiqueta de cada item.`)) return;
+      ids.forEach(id=>{ const t=State.tx.find(x=>x.id===id); if(t) t.card=false; });
+      save('tx', State.tx); renderAll();
+    };
     sec.querySelectorAll('[data-f]').forEach(c=> c.onclick=()=>{ txFilter=c.dataset.f; renderTx(); });
     sec.querySelectorAll('[data-del]').forEach(b=> b.onclick=()=>{ if(confirm('Remover este lançamento?')) delTx(b.dataset.del); });
     sec.querySelectorAll('[data-edit]').forEach(b=> b.onclick=()=>{ editingTxId=b.dataset.edit; renderTx(); });
@@ -716,6 +742,12 @@
     wireDonutClicks(sec);
   }
 
+  function payTagHtml(t){
+    if(t.fixedId || t.type!=='out' || txKind(t)==='parcela') return '';
+    const card = isCardTx(t);
+    return ` · <span class="tag" data-toggle-card="${t.id}" title="Clique para corrigir a forma de pagamento" style="cursor:pointer;background:${card?'#ece3fb':'var(--mint)'};color:${card?'#6a4bb8':'var(--forest)'}">${card?'💳 cartão':'💵 dinheiro/pix'}</span>`;
+  }
+
   function viewRowHtml(t){
     const who = t.who==='a'?State.profile.a : t.who==='b'?State.profile.b : 'Ambos';
     const d=new Date(t.date+'T00:00'); const ds=d.toLocaleDateString('pt-BR',{day:'2-digit',month:'short'});
@@ -724,7 +756,7 @@
     return `<div class="row">
       <div class="dot ${t.type==='in'?'in':'out'}">${CAT_ICON[t.cat]||(t.type==='in'?'↑':'↓')}</div>
       <div class="meta"><div class="t">${esc(t.desc||t.cat)}</div>
-        <div class="s">${ds} · <span class="tag">${esc(t.cat)}</span> · ${esc(who)}${t.fixedId?' · <span class="tag" style="background:var(--mint);color:var(--forest)">fixa</span>':''}${txKind(t)==='parcela'?' · <span class="tag" style="background:var(--coral-soft);color:var(--coral)">parcela</span>':''}${(!t.fixedId && t.type==='out' && txKind(t)!=='parcela' && isCardTx(t))?' · <span class="tag" style="background:#ece3fb;color:#6a4bb8">cartão</span>':''}${dueTxt}</div></div>
+        <div class="s">${ds} · <span class="tag">${esc(t.cat)}</span> · ${esc(who)}${t.fixedId?' · <span class="tag" style="background:var(--mint);color:var(--forest)">fixa</span>':''}${txKind(t)==='parcela'?' · <span class="tag" style="background:var(--coral-soft);color:var(--coral)">parcela</span>':''}${payTagHtml(t)}${dueTxt}</div></div>
       <div class="amt ${t.type==='in'?'in':'out'}">${t.type==='in'?'+':'−'} ${fmtShort(t.amount)}</div>
       <button class="x" data-edit="${t.id}" title="Editar">✎</button>
       <button class="x" data-del="${t.id}" title="Remover">✕</button>
@@ -1232,16 +1264,31 @@
         if(isPay){ type="in"; cat="Estorno"; ignore=true; note="pagamento da fatura"; }
         else if(it.raw<0){ type="in"; cat="Estorno"; }
         else { type="out"; [cat]=categorize(it.desc); }
-      } else { // account / extrato
-        if(it.raw<0){ type="out"; [cat]=categorize(it.desc); }
+      } else { // account / extrato — sempre entra como "A revisar": a categorização automática não é confiável
+               // para extrato bancário (descrições variadas de Pix/débito), então tudo passa por conferência manual.
+        if(it.raw<0){ type="out"; cat="A revisar"; }
         else { type="in"; cat="Outros"; }
       }
       const amount = Math.abs(it.raw);
       const key = it.date+"|"+it.desc.toLowerCase()+"|"+amount.toFixed(2);
       const dup = existing.has(key);
+      // conferência de segurança: mesma descrição já lançada perto dessa data, mas com valor diferente —
+      // pode ser o mesmo gasto com valor errado, uma correção da loja, ou duplicidade disfarçada. Sinaliza para revisão.
+      let warnDup = false;
+      if(!dup && type==='out'){
+        const dNorm = it.desc.trim().toLowerCase();
+        const itDate = new Date(it.date+'T00:00');
+        warnDup = State.tx.some(t=>{
+          if(t.type!=='out') return false;
+          if((t.desc||'').trim().toLowerCase()!==dNorm) return false;
+          if(Math.abs(t.amount-amount)<0.01) return false;
+          const td=new Date((t.date||'1970-01-01')+'T00:00');
+          return Math.abs((itDate-td)/86400000)<=5;
+        });
+      }
       const parc = parcelaInfo(it.desc);
-      return { _id:"imp"+idx, date:it.date, desc:it.desc, amount, type, cat,
-               include: !(dup||ignore), dup, note, parc, who:"ambos", comp: batchComp||undefined };
+      return { _id:"imp"+idx, date:it.date, desc:it.desc, amount, type, cat, source,
+               include: !(dup||ignore), dup, warnDup, note, parc, trackDebt:true, who:"ambos", comp: batchComp||undefined };
     });
   }
 
@@ -1250,6 +1297,7 @@
   let importRows = [];   // linhas em revisão
   let importMsg = "";
   let lastImportCompMode = null; // 'auto'|'fixed'|'real' — usado para sincronizar a lente após importar
+  let importExpectedTotal = null; // valor total da fatura digitado pelo usuário, para conferência de segurança
 
   function renderImport(){
     const sec = document.getElementById('sec-import');
@@ -1260,6 +1308,11 @@
     const parcs = importRows.filter(r=>r.include && r.parc);
     const totalOut = importRows.filter(r=>r.include && r.type==='out').reduce((a,b)=>a+b.amount,0);
     const totalIn  = importRows.filter(r=>r.include && r.type==='in').reduce((a,b)=>a+b.amount,0);
+
+    const netTotal = totalOut - totalIn;
+    const diff = importExpectedTotal!=null ? +(importExpectedTotal-netTotal).toFixed(2) : null;
+    const diffBad = diff!=null && Math.abs(diff)>0.01;
+    const warnCount = importRows.filter(r=>r.include && r.warnDup).length;
 
     sec.innerHTML = `
       <div class="sectionhead">
@@ -1286,10 +1339,13 @@
             <input id="impComp" type="month" value="${month}"></div>
           <div class="field" style="flex:0 0 150px"><label>Lançar como</label>
             <select id="impWho"><option value="ambos">Ambos</option><option value="a">${esc(State.profile.a)}</option><option value="b">${esc(State.profile.b)}</option></select></div>
+          <div class="field" style="flex:0 0 180px"><label>Valor total da fatura (conferência)</label>
+            <input id="impExpTotal" type="number" min="0" step="0.01" placeholder="opcional" value="${importExpectedTotal!=null?importExpectedTotal:''}"></div>
           <div class="field" style="flex:0 0 auto"><label>Arquivo CSV (opcional)</label>
             <input id="impFile" type="file" accept=".csv,.txt"></div>
         </div>
         <div class="desc" style="margin:0 0 12px"><b>Automática</b>: a fatura inteira entra no mês em que você a paga (mês das compras + 1). Ex.: fatura de compras de junho → você paga em julho → tudo entra em <b>julho</b>. Para extrato bancário, use “Data real”.</div>
+        <div class="desc" style="margin:0 0 12px">💳 Itens vindos de <b>Cartão de crédito (fatura)</b> entram no grupo <b>Compras no cartão</b>. Itens vindos de <b>Conta / extrato bancário</b> (dinheiro, Pix, débito automático, cartão de débito) <b>não</b> entram nesse grupo — ficam em Lançamentos do mês, sempre como <b>A revisar</b>. Você pode corrigir a forma de pagamento de qualquer item depois, clicando em ✎ editar.</div>
         <div class="field" style="margin-bottom:12px">
           <label>Ou cole aqui o conteúdo (linhas da fatura ou CSV)</label>
           <textarea id="impText" rows="6" placeholder="Ex.:&#10;28 ABR Bistek Supermercados R$ 220,16&#10;05 MAI Auto Posto Darolt R$ 244,32&#10;&#10;...ou cole o CSV exportado do app do banco." 
@@ -1305,21 +1361,26 @@
       ${pending? `
       <div class="grid g3" style="margin-bottom:16px">
         <div class="card stat"><div class="k">A importar</div><div class="v">${incl}</div><div class="hint">${pending} lidos · ${dups} já existem</div></div>
-        <div class="card stat"><div class="k">Saídas</div><div class="v neg">${fmt(totalOut)}</div><div class="hint">${rev} em “A revisar”</div></div>
+        <div class="card stat"><div class="k">Saídas</div><div class="v neg">${fmt(totalOut)}</div><div class="hint">${rev} em “A revisar”${warnCount?` · ${warnCount} ⚠ para conferir`:''}</div></div>
         <div class="card stat accent"><div class="k">Entradas</div><div class="v">${fmt(totalIn)}</div><div class="hint">estornos / recebimentos</div></div>
+        ${importExpectedTotal!=null ? `<div class="card stat" style="${diffBad?'border-color:var(--coral)':''}">
+          <div class="k">🛡️ Conferência da fatura</div>
+          <div class="v" style="${diffBad?'color:var(--coral)':'color:var(--forest)'}">${diffBad? (diff>0?'faltam '+fmt(diff):'sobram '+fmt(Math.abs(diff))) : '✓ bate certinho'}</div>
+          <div class="hint">Informada: ${fmt(importExpectedTotal)} · Reconhecida: ${fmt(netTotal)}</div>
+        </div>` : ''}
       </div>
 
       ${parcs.length? `<div class="card" style="margin-bottom:16px">
         <h3>🧩 Parcelamentos detectados (${parcs.length})</h3>
+        <div class="desc" style="margin-bottom:10px">Ao importar, os marcados abaixo são criados em <b>Dívidas</b> automaticamente (se ainda não existirem) ou têm a parcela paga avançada sozinha, caso já exista uma dívida com esse nome.</div>
         <div class="list">${parcs.map(r=>`
           <div class="row">
             <label style="display:flex;align-items:center;gap:9px;flex:1;cursor:pointer">
-              <input type="checkbox" class="impParc" data-id="${r._id}" checked style="width:auto">
+              <input type="checkbox" class="impParc" data-id="${r._id}" ${r.trackDebt!==false?'checked':''} style="width:auto">
               <span class="meta"><span class="t">${esc(r.parc.name)}</span>
               <span class="s">parcela ${r.parc.cur}/${r.parc.n} · ${fmt(r.amount)} cada</span></span>
             </label>
           </div>`).join("")}</div>
-        <button class="btn gold sm" id="impAddDebts" style="margin-top:12px">+ Adicionar marcados às Dívidas</button>
       </div>`:''}
 
       <div class="card">
@@ -1334,7 +1395,7 @@
               <input type="checkbox" class="impInc" data-id="${r._id}" ${r.include?'checked':''} style="width:auto;flex:none">
               <div class="dot ${r.type==='in'?'in':'out'}" style="width:32px;height:32px;font-size:14px">${CAT_ICON[r.cat]||(r.type==='in'?'↑':'↓')}</div>
               <div class="meta"><div class="t">${esc(r.desc)}</div>
-                <div class="s">${ds} ${r.comp?'· <span class="tag" style="background:var(--mint);color:var(--forest)">'+r.comp+'</span>':''} ${r.dup?'· <span class="tag" style="background:var(--gold-soft);color:#8a5d00">já existe</span>':''} ${r.note?'· <span class="tag">'+esc(r.note)+'</span>':''} ${r.cat==='A revisar'?'· <span class="tag" style="background:var(--coral-soft);color:var(--coral)">revisar</span>':''}</div></div>
+                <div class="s">${ds} ${r.comp?'· <span class="tag" style="background:var(--mint);color:var(--forest)">'+r.comp+'</span>':''} ${r.dup?'· <span class="tag" style="background:var(--gold-soft);color:#8a5d00">já existe</span>':''} ${r.note?'· <span class="tag">'+esc(r.note)+'</span>':''} ${r.cat==='A revisar'?'· <span class="tag" style="background:var(--coral-soft);color:var(--coral)">revisar</span>':''} ${r.warnDup?'· <span class="tag" style="background:var(--coral-soft);color:var(--coral)">⚠ confira o valor — já existe algo parecido</span>':''}</div></div>
               <select class="impCat" data-id="${r._id}" style="flex:0 0 160px">${sel}</select>
               <div class="amt ${r.type==='in'?'in':'out'}" style="flex:0 0 90px;text-align:right">${r.type==='in'?'+':'−'} ${fmtShort(r.amount)}</div>
             </div>`;
@@ -1355,14 +1416,13 @@
       const f=e.target.files[0]; if(!f) return;
       const rd=new FileReader(); rd.onload=()=>{ sec.querySelector('#impText').value = rd.result; }; rd.readAsText(f);
     };
-    if(sec.querySelector('#impClear')) sec.querySelector('#impClear').onclick=()=>{ importRows=[]; importMsg=""; renderImport(); };
+    if(sec.querySelector('#impClear')) sec.querySelector('#impClear').onclick=()=>{ importRows=[]; importMsg=""; importExpectedTotal=null; renderImport(); };
     sec.querySelectorAll('.impInc').forEach(c=> c.onchange=()=>{ const r=importRows.find(x=>x._id===c.dataset.id); r.include=c.checked; renderImport(); });
     sec.querySelectorAll('.impCat').forEach(s=> s.onchange=()=>{ const r=importRows.find(x=>x._id===s.dataset.id); r.cat=s.value; });
+    sec.querySelectorAll('.impParc').forEach(c=> c.onchange=()=>{ const r=importRows.find(x=>x._id===c.dataset.id); if(r) r.trackDebt=c.checked; });
+    const etEl=sec.querySelector('#impExpTotal');
+    if(etEl) etEl.onchange=()=>{ const v=parseFloat(etEl.value); importExpectedTotal = (etEl.value===''||isNaN(v))?null:v; renderImport(); };
     if(sec.querySelector('#impCommit')) sec.querySelector('#impCommit').onclick=commitImport;
-    if(sec.querySelector('#impAddDebts')) sec.querySelector('#impAddDebts').onclick=()=>{
-      const checked = Array.from(sec.querySelectorAll('.impParc')).filter(c=>c.checked).map(c=>c.dataset.id);
-      addParcelasToDebts(checked);
-    };
   }
 
   function doAnalyze(){
@@ -1388,11 +1448,18 @@
     const add = importRows.filter(r=>r.include);
     if(!add.length){ importMsg="Nada marcado para importar."; renderImport(); return; }
     add.forEach(r=>{
-      State.tx.push({ id:uid(), type:r.type, amount:r.amount, cat:r.cat, who:r.who||"ambos", date:r.date, desc:r.desc, comp:r.comp||undefined, imp:true });
+      // origem "Cartão de crédito (fatura)" = entra no grupo "Compras no cartão".
+      // origem "Conta / extrato bancário" = pago em dinheiro/Pix/débito — não deve entrar nesse grupo.
+      State.tx.push({ id:uid(), type:r.type, amount:r.amount, cat:r.cat, who:r.who||"ambos", date:r.date, desc:r.desc, comp:r.comp||undefined,
+        imp:true, source:r.source, card:(r.source==='account'?false:undefined) });
     });
     save('tx', State.tx);
     const n=add.length;
     const target = add[0].comp || add[0].date.slice(0,7);
+
+    // Dívidas automáticas: parcelamentos detectados nos itens importados (marcados) criam ou avançam a dívida sozinhos.
+    const parcRows = add.filter(r=>r.parc && r.trackDebt!==false);
+    const debtResult = parcRows.length ? autoUpdateDebtsFromParcelas(parcRows) : {added:0, advanced:0};
 
     // CORREÇÃO: a lente global precisa combinar com a competência escolhida na importação,
     // senão os lançamentos ficam "invisíveis" no mês pra onde acabamos de navegar.
@@ -1403,7 +1470,7 @@
     save('lens', lens);
     updateLensChips();
 
-    importRows=[]; importMsg="";
+    importRows=[]; importMsg=""; importExpectedTotal=null;
     month = target; document.getElementById('mLabel').textContent = monthLabel(month);
     renderLensHint();
     renderAll();
@@ -1411,22 +1478,29 @@
     const lensMsg = lensBefore!==lens
       ? `\n\n(A lente "Contabilizar por" foi ajustada automaticamente para "${lens==='caixa'?'Mês do pagamento':'Mês da compra'}" para bater com a competência escolhida na importação — senão os lançamentos não apareceriam aqui.)`
       : '';
-    alert(n+" lançamento(s) importado(s) com sucesso em "+monthLabel(target)+"!"+lensMsg);
+    const debtMsg = (debtResult.added||debtResult.advanced)
+      ? `\n\nDívidas atualizadas: ${debtResult.added?debtResult.added+' nova(s)':''}${debtResult.added&&debtResult.advanced?' · ':''}${debtResult.advanced?debtResult.advanced+' parcela(s) avançada(s)':''}.`
+      : '';
+    alert(n+" lançamento(s) importado(s) com sucesso em "+monthLabel(target)+"!"+debtMsg+lensMsg);
   }
 
-  function addParcelasToDebts(ids){
-    const existing=new Set(State.debts.map(d=>d.name.toLowerCase()));
-    let added=0;
-    ids.forEach(id=>{
-      const r=importRows.find(x=>x._id===id); if(!r||!r.parc) return;
-      if(existing.has(r.parc.name.toLowerCase())) return;
-      State.debts.push({ id:uid(), name:r.parc.name, total:+(r.amount*r.parc.n).toFixed(2),
-                         n:r.parc.n, paid:r.parc.cur, due:5 });
-      existing.add(r.parc.name.toLowerCase()); added++;
+  // Cria a dívida se ainda não existir, ou avança a parcela paga se já existir uma com o mesmo nome —
+  // roda sozinho ao importar a fatura, sem precisar de ação manual.
+  function autoUpdateDebtsFromParcelas(rows){
+    let added=0, advanced=0;
+    rows.forEach(r=>{
+      const existing = State.debts.find(d=> d.name.toLowerCase()===r.parc.name.toLowerCase());
+      if(existing){
+        if(r.parc.n && r.parc.n!==existing.n) existing.n = r.parc.n;
+        if(r.parc.cur > (existing.paid||0)){ existing.paid = r.parc.cur; advanced++; }
+      } else {
+        State.debts.push({ id:uid(), name:r.parc.name, total:+(r.amount*r.parc.n).toFixed(2),
+                           n:r.parc.n, paid:r.parc.cur, due:5 });
+        added++;
+      }
     });
-    save('debts', State.debts);
-    renderDebts(); renderDash();
-    alert(added+" parcelamento(s) adicionado(s) às Dívidas."+(added<ids.length?" (alguns já existiam)":""));
+    if(added||advanced) save('debts', State.debts);
+    return {added, advanced};
   }
 
 
@@ -1771,7 +1845,7 @@
     const name=inp.value.trim(); if(!name) return;
     const arr = kind==='out'?CAT_OUT:CAT_IN;
     if(arr.some(c=>c.toLowerCase()===name.toLowerCase())){ alert('Essa categoria já existe.'); return; }
-    arr.push(name); saveCats(); renderAll();
+    arr.push(name); ptSort(arr); saveCats(); renderAll();
   }
 
   function removeCat(kind, name){
@@ -1792,6 +1866,7 @@
     const arr = kind==='out'?CAT_OUT:CAT_IN;
     if(name!==oldName && arr.some(c=>c.toLowerCase()===name.toLowerCase())){ alert('Já existe uma categoria com esse nome.'); return; }
     const i=arr.indexOf(oldName); if(i<0) return; arr[i]=name;
+    ptSort(arr);
     // propaga o novo nome para os usos existentes
     State.tx.forEach(t=>{ if(t.cat===oldName) t.cat=name; });
     State.budget.forEach(b=>{ if(b.cat===oldName) b.cat=name; });
@@ -1835,10 +1910,12 @@
     const sc = await load('cats', null);
     if(sc && sc.out && sc.in){ CAT_OUT = sc.out; CAT_IN = sc.in; }
     else { await save('cats', {out:CAT_OUT, in:CAT_IN}); }
+    ptSort(CAT_OUT); ptSort(CAT_IN); // garante ordem alfabética mesmo em dados salvos antes desta função existir
     // migração: pré-carrega as despesas fixas de maio (planilha família Rodrigues) — só na 1ª vez
     const migFixMaio = await load('mig_fixed_maio', false);
     if(!migFixMaio){
       ["Dízimo","Moradia","Saúde","Escola"].forEach(c=>{ if(CAT_OUT.indexOf(c)<0) CAT_OUT.push(c); });
+      ptSort(CAT_OUT);
       await save('cats', {out:CAT_OUT, in:CAT_IN});
       if(State.fixed.length===0){
         State.fixed = SEED_FIXED.map((f,i)=>Object.assign({id:'fxm'+i, start:'2026-05', dueDay:0}, f));
