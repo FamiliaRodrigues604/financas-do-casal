@@ -206,6 +206,7 @@
   }
 </style>
 
+<div id="storageBanner"></div>
 <div id="app">
   <div class="loader"><div class="spin"></div><div>Carregando suas finanças…</div></div>
 </div>
@@ -219,17 +220,34 @@
   const SUPABASE_KEY = 'sb_publishable_guqTcabXyGBiKLeGlyk5og_ns2P-4OQ';
   const SB_HEADERS = { apikey: SUPABASE_KEY, Authorization: 'Bearer '+SUPABASE_KEY };
 
+  // Erro real de conexão/permissão — DIFERENTE de "chave não encontrada" (que é um resultado válido).
+  // Essa distinção é a correção do bug: antes, os dois casos eram tratados como a mesma coisa (null),
+  // e o app não tinha como saber se "não achou nada" era porque é a 1ª vez ou porque a conexão falhou.
+  function StorageError(msg){ this.message = msg; this.name = 'StorageError'; }
+  StorageError.prototype = Object.create(Error.prototype);
+
+  let STORAGE_OK = true;
+  let STORAGE_LAST_ERROR = '';
+  let pendingWrites = {}; // dados que tentamos salvar e falharam — ficam em memória até reconectar
+  function setStorageStatus(ok, err){
+    const changed = (STORAGE_OK!==ok);
+    STORAGE_OK = ok; STORAGE_LAST_ERROR = err||'';
+    if(changed || !ok) renderStorageBanner();
+  }
+
   const storage = {
     async get(key){
       try{
         const res = await fetch(SUPABASE_URL+'/rest/v1/app_storage?key=eq.'+encodeURIComponent(key)+'&select=value', { headers: SB_HEADERS });
-        if(!res.ok) return null;
+        if(!res.ok){ setStorageStatus(false, 'HTTP '+res.status+' ao ler'); return { ok:false }; }
         const rows = await res.json();
-        if(!rows.length) return null;
-        return { key, value: rows[0].value, shared:false };
-      }catch(e){ console.error('storage.get falhou', e); return null; }
+        setStorageStatus(true);
+        if(!rows.length) return { ok:true, found:false };
+        return { ok:true, found:true, value: rows[0].value };
+      }catch(e){ console.error('storage.get falhou', e); setStorageStatus(false, String((e&&e.message)||e)); return { ok:false }; }
     },
-    async set(key, value){
+    async set(key, value, attempt){
+      attempt = attempt||1;
       try{
         const res = await fetch(SUPABASE_URL+'/rest/v1/app_storage', {
           method:'POST',
@@ -237,14 +255,21 @@
           body: JSON.stringify({ key, value, updated_at: new Date().toISOString() })
         });
         if(!res.ok) throw new Error('HTTP '+res.status);
-        return { key, value, shared:false };
-      }catch(e){ console.error('storage.set falhou', e); return null; }
+        setStorageStatus(true);
+        return { ok:true };
+      }catch(e){
+        console.error('storage.set falhou ('+key+', tentativa '+attempt+')', e);
+        if(attempt<3){ await new Promise(r=>setTimeout(r, 500*attempt)); return storage.set(key, value, attempt+1); }
+        setStorageStatus(false, String((e&&e.message)||e));
+        return { ok:false };
+      }
     },
     async delete(key){
       try{
         await fetch(SUPABASE_URL+'/rest/v1/app_storage?key=eq.'+encodeURIComponent(key), { method:'DELETE', headers: SB_HEADERS });
-        return { key, deleted:true };
-      }catch(e){ console.error('storage.delete falhou', e); return null; }
+        setStorageStatus(true);
+        return { ok:true };
+      }catch(e){ console.error('storage.delete falhou', e); setStorageStatus(false, String((e&&e.message)||e)); return { ok:false }; }
     },
     async list(prefix){
       try{
@@ -252,17 +277,99 @@
         if(prefix) url += '&key=like.'+encodeURIComponent(prefix)+'*';
         const res = await fetch(url, { headers: SB_HEADERS });
         const rows = await res.json();
+        setStorageStatus(true);
         return { keys: rows.map(r=>r.key) };
-      }catch(e){ console.error('storage.list falhou', e); return { keys: [] }; }
+      }catch(e){ console.error('storage.list falhou', e); setStorageStatus(false, String((e&&e.message)||e)); return { keys: [] }; }
     }
   };
+
+  // load(): se a chave genuinamente não existir, devolve o valor padrão (fb) — comportamento normal.
+  // Se a LEITURA falhar (rede, permissão, projeto pausado), lança StorageError — nunca mais silenciosamente
+  // devolve o padrão, porque é exatamente essa confusão que fazia o app achar "é a 1ª vez" e resetar dados reais.
   async function load(key, fb){
-    try{ const r=await storage.get(key,false); return (r&&r.value!=null)?JSON.parse(r.value):fb; }
-    catch(e){ return fb; }
+    const r = await storage.get(key);
+    if(!r.ok) throw new StorageError('Falha ao carregar "'+key+'"');
+    if(!r.found) return fb;
+    try{ return JSON.parse(r.value); }catch(e){ return fb; }
   }
   async function save(key, data){
-    try{ await storage.set(key, JSON.stringify(data), false); }
-    catch(e){ console.error('save '+key+' falhou', e); }
+    const r = await storage.set(key, JSON.stringify(data));
+    if(!r.ok){ pendingWrites[key] = data; return false; }
+    delete pendingWrites[key];
+    return true;
+  }
+  async function retrySaveAll(){
+    const keys = Object.keys(pendingWrites);
+    await Promise.all([
+      save('tx', State.tx), save('budget', State.budget), save('goals', State.goals),
+      save('debts', State.debts), save('fixed', State.fixed), save('investments', State.investments),
+      save('invSnapshots', State.invSnapshots), save('merchantMap', State.merchantMap),
+      save('profile', State.profile), save('cats', {out:CAT_OUT, in:CAT_IN}), save('lens', lens)
+    ]);
+    renderStorageBanner();
+  }
+  function downloadBackup(){
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      profile: State.profile, tx: State.tx, budget: State.budget, goals: State.goals,
+      debts: State.debts, fixed: State.fixed, investments: State.investments,
+      invSnapshots: State.invSnapshots, merchantMap: State.merchantMap,
+      cats: {out:CAT_OUT, in:CAT_IN}, lens
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'backup-financas-'+todayISO()+'.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  }
+  function restoreBackup(file){
+    const rd = new FileReader();
+    rd.onload = async ()=>{
+      let p;
+      try{ p = JSON.parse(rd.result); }catch(e){ alert('Arquivo de backup inválido: não é um JSON válido.'); return; }
+      if(!confirm('Isso vai SUBSTITUIR os dados atuais do painel pelos do backup de '+(p.exportedAt||'data desconhecida')+'. Continuar?')) return;
+      State.profile = p.profile || State.profile;
+      State.tx = p.tx || []; State.budget = p.budget || []; State.goals = p.goals || [];
+      State.debts = p.debts || []; State.fixed = p.fixed || [];
+      State.investments = p.investments || []; State.invSnapshots = p.invSnapshots || [];
+      State.merchantMap = p.merchantMap || {};
+      if(p.cats){ CAT_OUT = p.cats.out||CAT_OUT; CAT_IN = p.cats.in||CAT_IN; ptSort(CAT_OUT); ptSort(CAT_IN); }
+      if(p.lens) lens = p.lens;
+      await retrySaveAll();
+      renderAll();
+      alert('Backup restaurado com sucesso.');
+    };
+    rd.readAsText(file);
+  }
+  function showFatalStorageError(e){
+    console.error('Falha fatal ao carregar dados', e);
+    const app = document.getElementById('app');
+    if(app) app.innerHTML = `
+      <div class="loader" style="height:70vh">
+        <div style="font-size:40px">🔴</div>
+        <div style="max-width:420px;text-align:center;font-size:14.5px;color:var(--ink);line-height:1.5">
+          <b>Não foi possível conectar ao banco de dados.</b><br><br>
+          Por segurança, o painel NÃO vai carregar nem sobrescrever nada enquanto isso não for resolvido —
+          assim nenhum lançamento seu corre risco.<br><br>
+          Verifique sua internet e recarregue a página. Se persistir, o projeto do Supabase pode estar pausado por inatividade.
+        </div>
+        <button class="btn" onclick="location.reload()">🔄 Tentar novamente</button>
+      </div>`;
+  }
+  function renderStorageBanner(){
+    const el = document.getElementById('storageBanner'); if(!el) return;
+    if(STORAGE_OK){
+      el.innerHTML = `<div style="position:fixed;top:8px;right:8px;z-index:999;font-size:11.5px;background:var(--paper);border:1px solid var(--line);border-radius:20px;padding:4px 10px;box-shadow:0 1px 4px rgba(0,0,0,.08);color:var(--forest);font-weight:600">🟢 Conectado</div>`;
+    } else {
+      el.innerHTML = `<div style="position:sticky;top:0;z-index:999;background:var(--coral);color:#fff;padding:10px 16px;text-align:center;font-size:13px;font-weight:600;line-height:1.5">
+        ⚠️ Não foi possível salvar/carregar agora — seus lançamentos podem NÃO estar sendo gravados${STORAGE_LAST_ERROR?' ('+esc(STORAGE_LAST_ERROR)+')':''}. Não feche a aba.
+        <button id="retryStorage" style="margin-left:10px;background:#fff;color:var(--coral);border:none;border-radius:6px;padding:4px 10px;font-weight:700;cursor:pointer">🔄 Tentar de novo</button>
+        <button id="dlBackupNow" style="margin-left:6px;background:#fff;color:var(--coral);border:none;border-radius:6px;padding:4px 10px;font-weight:700;cursor:pointer">📥 Baixar backup agora</button>
+      </div>`;
+      const rb=document.getElementById('retryStorage'); if(rb) rb.onclick=retrySaveAll;
+      const db=document.getElementById('dlBackupNow'); if(db) db.onclick=downloadBackup;
+    }
   }
 
   /* ---------- state ---------- */
@@ -272,8 +379,12 @@
     budget:[],        // {cat, limit}
     goals:[],         // {id,name,target,saved,deadline}
     debts:[],         // {id,name,total,n,paid,due,start}
-    fixed:[]          // {id,name,cat,amount,dueDay,who}
+    fixed:[],         // {id,name,cat,amount,dueDay,who}
+    investments:[],   // {id,name,cat:'Renda Fixa'|'Renda Variável',country:'BR'|'EUA',broker,currency:'BRL'|'USD'}
+    invSnapshots:[],  // {id,posId,month:'YYYY-MM',qty,value,rate,valueBRL}
+    merchantMap:{}    // {"comerciante normalizado": "Categoria"} — aprendido das suas correções
   };
+  let usdRate = null, usdRateAt = null, usdRateLoading = false;
   let month = ymNow();          // 'YYYY-MM'
   let txFilter = 'all';         // all|in|out
   let lens = 'competencia';     // 'competencia' (mês da compra) | 'caixa' (mês do pagamento)
@@ -441,6 +552,7 @@
         <button data-tab="tx">Lançamentos</button>
         <button data-tab="debts">Dívidas</button>
         <button data-tab="goals">Metas</button>
+        <button data-tab="patrimonio">Patrimônio</button>
         <button data-tab="analysis">Análise</button>
         <button data-tab="year">Panorama Anual</button>
         <button data-tab="import">Importar</button>
@@ -450,19 +562,27 @@
       <section id="sec-tx"></section>
       <section id="sec-budget"></section>
       <section id="sec-goals"></section>
+      <section id="sec-patrimonio"></section>
       <section id="sec-debts"></section>
       <section id="sec-import"></section>
       <section id="sec-fixed"></section>
       <section id="sec-analysis"></section>
       <section id="sec-year"></section>
 
-      <div class="footnote">Os dados ficam salvos automaticamente neste dispositivo/conta. Use sempre o mesmo acesso para manter o histórico.</div>
+      <div class="footnote">Os dados ficam salvos automaticamente neste dispositivo/conta. Use sempre o mesmo acesso para manter o histórico.<br>
+        <button class="btn ghost sm" id="dlBackup" style="margin-top:8px">📥 Baixar backup (.json)</button>
+        <label class="btn ghost sm" style="margin-top:8px;display:inline-block;cursor:pointer">📤 Restaurar backup
+          <input type="file" id="upBackup" accept=".json" style="display:none">
+        </label>
+      </div>
     </div>`;
 
     document.getElementById('mLabel').textContent = monthLabel(month);
     document.getElementById('mPrev').onclick = ()=>shiftMonth(-1);
     document.getElementById('mNext').onclick = ()=>shiftMonth(1);
     document.getElementById('namesBtn').onclick = editNames;
+    document.getElementById('dlBackup').onclick = downloadBackup;
+    document.getElementById('upBackup').onchange = (e)=>{ const f=e.target.files[0]; if(f) restoreBackup(f); e.target.value=''; };
     document.querySelectorAll('[data-lens]').forEach(el=> el.onclick=()=>{
       lens = el.dataset.lens; save('lens', lens);
       updateLensChips(); renderLensHint();
@@ -522,7 +642,7 @@
     renderAll();
   }
 
-  function renderAll(){ renderDash(); renderTx(); renderBudget(); renderGoals(); renderDebts(); renderImport(); renderAnalysis(); renderFixed(); renderYear(); }
+  function renderAll(){ renderDash(); renderTx(); renderBudget(); renderGoals(); renderDebts(); renderImport(); renderAnalysis(); renderFixed(); renderYear(); renderPatrimonio(); }
 
   /* ---------- DASHBOARD ---------- */
   function renderDash(){
@@ -649,70 +769,6 @@
     else if(txKindFilter) filterBanner=`<div class="activefilter">Mostrando <b>${esc(KIND_LABEL[txKindFilter]||txKindFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
     else if(txBucketFilter) filterBanner=`<div class="activefilter">Mostrando <b>${BUCKET_ICON[txBucketFilter]||''} ${esc(BUCKET_LABEL[txBucketFilter]||txBucketFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
 
-    // ===== TOTAL DO QUE ESTÁ NA TELA =====
-    // Filtrar sem somar não responde a pergunta "quanto gastei com isso". Este bloco soma
-    // exatamente o que a lista está mostrando e compara com o mês anterior.
-    const fOutL = list.filter(t=>t.type==='out');
-    const fInL  = list.filter(t=>t.type==='in');
-    const fOut  = fOutL.reduce((a,b)=>a+b.amount,0);
-    const fIn   = fInL.reduce((a,b)=>a+b.amount,0);
-    const monthOutTotal = outL.reduce((a,b)=>a+b.amount,0);
-    const anyFilter = !!(txCatFilter||txKindFilter||txBucketFilter) || txFilter!=='all';
-    let summaryHtml='';
-    if(anyFilter && list.length){
-      const share = monthOutTotal>0 ? (fOut/monthOutTotal*100) : 0;
-      const avg   = fOutL.length ? fOut/fOutL.length : 0;
-      const big   = fOutL.slice().sort((a,b)=>b.amount-a.amount)[0];
-
-      // comparação com o mês anterior, mesmo critério de filtro
-      const prevYM = addMonthYM(month,-1);
-      let prevSum = null;
-      if(txCatFilter){
-        prevSum = txOfMonth(prevYM).filter(t=>t.type==='out' && t.cat===txCatFilter).reduce((a,b)=>a+b.amount,0);
-      } else if(txKindFilter){
-        prevSum = txOfMonth(prevYM).filter(t=>t.type==='out' && txKind(t)===txKindFilter).reduce((a,b)=>a+b.amount,0);
-      } else if(txBucketFilter){
-        prevSum = txBucketsForMonth(prevYM)[txBucketFilter].filter(t=>t.type==='out').reduce((a,b)=>a+b.amount,0);
-      }
-      let cmpHtml='';
-      if(prevSum!=null){
-        if(prevSum<=0.005){
-          cmpHtml = `<div class="hint">${monthLabel(prevYM)}: nada lançado</div>`;
-        } else {
-          const d = fOut - prevSum;
-          const pct = prevSum>0 ? (d/prevSum*100) : 0;
-          const up = d>0.005, flat = Math.abs(d)<=0.005;
-          const col = flat?'var(--ink-soft)':(up?'var(--coral)':'var(--forest)');
-          cmpHtml = `<div class="hint" style="color:${col}">${flat?'igual a':(up?'▲ '+fmt(Math.abs(d))+' acima de':'▼ '+fmt(Math.abs(d))+' abaixo de')} ${monthLabel(prevYM)} (${fmt(prevSum)})${flat?'':' · '+(up?'+':'−')+Math.abs(pct).toFixed(0)+'%'}</div>`;
-        }
-      }
-
-      const label = txCatFilter ? (CAT_ICON[txCatFilter]||'•')+' '+esc(txCatFilter)
-                  : txKindFilter ? esc(KIND_LABEL[txKindFilter]||txKindFilter)
-                  : txBucketFilter ? esc(BUCKET_LABEL[txBucketFilter]||txBucketFilter)
-                  : (txFilter==='in'?'Receitas':txFilter==='out'?'Despesas':'Seleção');
-
-      summaryHtml = `
-      <div class="grid g3" style="margin-bottom:16px">
-        <div class="card stat accent">
-          <div class="k">Total — ${label} · ${monthLabel(month)}</div>
-          <div class="v ${fOut>0?'neg':''}">${fOut>0?fmt(fOut):fmt(fIn)}</div>
-          ${cmpHtml || `<div class="hint">${fOutL.length||fInL.length} lançamento(s)</div>`}
-        </div>
-        <div class="card stat">
-          <div class="k">Peso no mês</div>
-          <div class="v">${monthOutTotal>0 && fOut>0 ? share.toFixed(1).replace('.',',')+'%' : '—'}</div>
-          <div class="hint">${fOut>0?'de '+fmt(monthOutTotal)+' em despesas':'sem despesas neste filtro'}</div>
-        </div>
-        <div class="card stat">
-          <div class="k">Média por lançamento</div>
-          <div class="v">${fOutL.length?fmt(avg):'—'}</div>
-          <div class="hint">${fOutL.length} lançamento(s)${big?' · maior: '+fmt(big.amount)+(big.desc?' ('+esc(String(big.desc).slice(0,28))+')':''):''}</div>
-        </div>
-        ${fIn>0 && fOut>0 ? `<div class="card stat"><div class="k">Entradas neste filtro</div><div class="v">${fmt(fIn)}</div><div class="hint">${fInL.length} lançamento(s) · líquido ${fmt(fOut-fIn)}</div></div>`:''}
-      </div>`;
-    }
-
     // separa a lista em grupos por origem: receitas, fixas, compras no cartão, avulsas do mês
     const groupOrder=['receita','fixa','importada','avulsa'];
     const groups={receita:[],fixa:[],importada:[],avulsa:[]};
@@ -721,14 +777,12 @@
       const arr=groups[g]; if(!arr.length) return '';
       if(g==='importada' && txValueSort) arr.sort((a,b)=> txValueSort==='desc' ? b.amount-a.amount : a.amount-b.amount);
       const rows=arr.map(t=> t.id===editingTxId ? editRowHtml(t) : viewRowHtml(t)).join("");
-      const gSum = arr.reduce((a,b)=> a + (b.type==='out'? b.amount : -b.amount), 0);
-      const gTot = `<span style="margin-left:10px;font-weight:600;font-size:12.5px;color:${gSum>=0?'var(--coral)':'var(--forest)'}">${gSum>=0?'':'+'}${fmt(Math.abs(gSum))}</span>`;
       const sortCtl = g==='importada' ? `
         <span class="valuesort" id="valueSortBtn" title="Ordenar por valor" style="margin-left:auto;cursor:pointer;font-weight:400;font-size:12.5px;color:var(--ink-soft);user-select:none">
           Valor (R$) ${txValueSort==='desc'?'▼':txValueSort==='asc'?'▲':'⇅'}
         </span>
         <button type="button" class="btn ghost sm" id="bulkMarkCash" data-ids="${arr.map(t=>t.id).join(',')}" style="margin-left:10px;font-weight:400;font-size:12px;padding:3px 9px">Marcar tudo como Dinheiro/Pix</button>` : '';
-      return `<div class="txgroup-head" style="display:flex;align-items:center">${GROUP_ICON[g]} ${GROUP_LABEL[g]} <span class="cnt">${arr.length}</span>${gTot}${sortCtl}</div>${rows}`;
+      return `<div class="txgroup-head" style="display:flex;align-items:center">${GROUP_ICON[g]} ${GROUP_LABEL[g]} <span class="cnt">${arr.length}</span>${sortCtl}</div>${rows}`;
     }).join("");
 
     sec.innerHTML = `
@@ -767,8 +821,6 @@
       </div>
 
       ${filterBanner}
-
-      ${summaryHtml}
 
       ${pieHtml}
 
@@ -889,6 +941,7 @@
         save('debts', State.debts); renderDebts();
       }
     }
+    if(type==='out') learnMerchant(desc||cat, cat);
     save('tx', State.tx);
     renderTx(); renderDash(); renderBudget();
   }
@@ -904,6 +957,7 @@
     const cardSel=g('eCard').value;
     t.card = cardSel==='card' ? true : (cardSel==='cash' ? false : undefined);
     editingTxId=null;
+    if(t.type==='out') learnMerchant(t.desc, t.cat);
     save('tx', State.tx);
     renderAll();
   }
@@ -1083,6 +1137,210 @@
     save('debts',State.debts); renderDebts(); renderDash();
   }
 
+  /* ---------- PATRIMÔNIO (investimentos) ---------- */
+  const INV_GROUPS = [
+    {cat:'Renda Fixa',      country:'BR',  label:'🏦 Renda Fixa · Brasil'},
+    {cat:'Renda Variável',  country:'BR',  label:'📈 Renda Variável · Brasil'},
+    {cat:'Renda Fixa',      country:'EUA', label:'🏦 Renda Fixa · EUA'},
+    {cat:'Renda Variável',  country:'EUA', label:'📈 Renda Variável · EUA'}
+  ];
+
+  async function refreshUsdRate(){
+    if(usdRateLoading) return;
+    usdRateLoading = true;
+    try{
+      const r = await fetch('https://api.frankfurter.app/latest?from=USD&to=BRL');
+      const j = await r.json();
+      if(j && j.rates && j.rates.BRL){ usdRate = j.rates.BRL; usdRateAt = new Date(); }
+    }catch(e){ console.error('cotação USD→BRL falhou', e); }
+    usdRateLoading = false;
+    renderPatrimonio();
+  }
+
+  function posLatestSnap(posId){
+    const snaps = State.invSnapshots.filter(s=>s.posId===posId).sort((a,b)=>a.month.localeCompare(b.month));
+    return snaps.length ? snaps[snaps.length-1] : null;
+  }
+
+  // total do patrimônio mês a mês, "carregando" (carry-forward) o último valor lançado de cada posição
+  function wealthTimeline(){
+    const months = Array.from(new Set(State.invSnapshots.map(s=>s.month))).sort();
+    if(!months.length) return [];
+    return months.map(m=>{
+      let total=0;
+      State.investments.forEach(p=>{
+        const snaps = State.invSnapshots.filter(s=>s.posId===p.id && s.month<=m).sort((a,b)=>a.month.localeCompare(b.month));
+        if(snaps.length) total += snaps[snaps.length-1].valueBRL;
+      });
+      return {month:m, total};
+    });
+  }
+
+  function wealthLineChart(series){
+    const W=780,H=220,padL=8,padR=8,padT=20,padB=34;
+    const chartW=W-padL-padR, chartH=H-padT-padB;
+    const maxV=Math.max(1, ...series.map(s=>s.total));
+    const stepX = series.length>1 ? chartW/(series.length-1) : 0;
+    const pts = series.map((s,i)=>({ x: padL+i*stepX, y: padT+chartH-(s.total/maxV*chartH), ...s }));
+    const path = pts.map((p,i)=> (i===0?'M':'L')+p.x.toFixed(1)+' '+p.y.toFixed(1)).join(' ');
+    const dots = pts.map(p=>`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="var(--forest)"><title>${monthLabel(p.month)}: ${fmt(p.total)}</title></circle>`).join('');
+    const everyN = Math.max(1, Math.ceil(pts.length/8));
+    const labels = pts.map((p,i)=> (i%everyN===0 || i===pts.length-1) ? `<text x="${p.x.toFixed(1)}" y="${H-14}" text-anchor="middle" font-family="var(--body)" font-size="10.5" fill="var(--ink-soft)">${p.month.slice(5)}/${p.month.slice(2,4)}</text>` : '').join('');
+    return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:100%;height:auto;display:block">
+      <line x1="${padL}" y1="${padT+chartH}" x2="${W-padR}" y2="${padT+chartH}" stroke="var(--line)" stroke-width="1"/>
+      <path d="${path}" fill="none" stroke="var(--forest)" stroke-width="2.5"/>
+      ${dots}${labels}
+    </svg>`;
+  }
+
+  function invPositionCard(p){
+    const latest = posLatestSnap(p.id);
+    const snaps = State.invSnapshots.filter(s=>s.posId===p.id).sort((a,b)=>b.month.localeCompare(a.month));
+    const rateField = p.currency==='USD' ? `
+      <div class="field" style="flex:0 0 120px"><label>Cotação US$→R$</label><input type="number" min="0" step="0.01" id="sRate-${p.id}" value="${usdRate?usdRate.toFixed(2):''}" placeholder="5,00"></div>` : '';
+    return `<div class="card" style="margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px">
+        <div>
+          <div style="font-weight:600;font-size:15px">${esc(p.name)}</div>
+          <div style="font-size:12.5px;color:var(--ink-soft)">${p.broker?esc(p.broker)+' · ':''}${p.currency}</div>
+        </div>
+        <button class="x" data-invdel="${p.id}" title="Remover posição">✕</button>
+      </div>
+      <div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+        <div style="font-family:var(--display);font-weight:600;font-size:22px">${latest? fmt(latest.valueBRL) : '—'}</div>
+        <div style="font-size:12.5px;color:var(--ink-soft)">
+          ${latest && p.currency==='USD' ? `US$ ${fmtShort(latest.value)} · cotação ${latest.rate.toFixed(2)} · ${monthLabel(latest.month)}` : ''}
+          ${latest && p.currency==='BRL' ? `${monthLabel(latest.month)}` : ''}
+          ${!latest ? `sem lançamento ainda` : ''}
+        </div>
+      </div>
+      <div class="formrow" style="margin-bottom:8px">
+        <div class="field" style="flex:0 0 140px"><label>Mês</label><input type="month" id="sMonth-${p.id}" value="${month}"></div>
+        <div class="field" style="flex:0 0 110px"><label>Qtd. (opc.)</label><input type="number" step="0.000001" id="sQty-${p.id}" placeholder="0"></div>
+        <div class="field" style="flex:0 0 140px"><label>Valor total (${p.currency})</label><input type="number" min="0" step="0.01" id="sVal-${p.id}" placeholder="0,00"></div>
+        ${rateField}
+        <button class="btn sm" data-invsnap="${p.id}">Lançar</button>
+      </div>
+      ${snaps.length? `<details>
+        <summary style="cursor:pointer;font-size:12.5px;color:var(--ink-soft)">Histórico (${snaps.length})</summary>
+        <div class="list" style="margin-top:6px">
+          ${snaps.map(s=>`<div class="row">
+            <div class="meta"><div class="t">${monthLabel(s.month)}</div>
+              <div class="s">${p.currency==='USD'? `US$ ${fmtShort(s.value)} · cotação ${s.rate.toFixed(2)}${s.qty?` · ${s.qty} cotas`:''}` : (s.qty?`${s.qty} cotas`:'')}</div></div>
+            <div class="amt in">${fmt(s.valueBRL)}</div>
+            <button class="x" data-snapdel="${s.id}" title="Remover lançamento">✕</button>
+          </div>`).join("")}
+        </div>
+      </details>` : ''}
+    </div>`;
+  }
+
+  function renderPatrimonio(){
+    const sec=document.getElementById('sec-patrimonio'); if(!sec) return;
+    if(usdRate===null && !usdRateLoading) refreshUsdRate();
+
+    const totalBRL = sum(State.investments.map(p=>{ const s=posLatestSnap(p.id); return s?s.valueBRL:0; }));
+    const totalByGroup = INV_GROUPS.map(gr=>{
+      const ps = State.investments.filter(p=>p.cat===gr.cat && p.country===gr.country);
+      const total = sum(ps.map(p=>{ const s=posLatestSnap(p.id); return s?s.valueBRL:0; }));
+      return Object.assign({}, gr, {ps, total});
+    });
+    const series = wealthTimeline();
+
+    sec.innerHTML = `
+      <div class="sectionhead">
+        <div><div class="lead">Patrimônio investido</div>
+        <div class="desc">Registrem cada posição — renda fixa e variável, Brasil e EUA — e lancem o valor mês a mês. Posições em dólar são convertidas automaticamente para reais.</div></div>
+      </div>
+
+      <div class="grid g3" style="margin-bottom:10px">
+        <div class="card stat accent"><div class="k">Patrimônio total (BRL)</div><div class="v">${fmt(totalBRL)}</div>
+          <div class="hint">${State.investments.length} posiç${State.investments.length===1?'ão':'ões'} cadastrada(s)</div></div>
+        ${totalByGroup.map(g=>`<div class="card stat"><div class="k">${g.label}</div><div class="v">${fmt(g.total)}</div><div class="hint">${g.ps.length} posição(ões)</div></div>`).join('')}
+      </div>
+
+      <div style="font-size:12.5px;color:var(--ink-soft);margin-bottom:16px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        💵 Cotação USD→BRL: <b>${usdRate? 'R$ '+usdRate.toFixed(2) : (usdRateLoading?'buscando…':'indisponível — informe manualmente ao lançar')}</b>
+        ${usdRateAt? `<span>(atualizada ${usdRateAt.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})})</span>`:''}
+        <button class="btn sm ghost" id="refreshRate">🔄 Atualizar</button>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <h3>➕ Nova posição</h3>
+        <div class="formrow">
+          <div class="field"><label>Nome</label><input id="iName" placeholder="Ex.: VOO, CDB Banco X, Tesouro Selic…"></div>
+          <div class="field" style="flex:0 0 160px"><label>Categoria</label>
+            <select id="iCat"><option value="Renda Fixa">Renda Fixa</option><option value="Renda Variável">Renda Variável</option></select></div>
+          <div class="field" style="flex:0 0 130px"><label>País</label>
+            <select id="iCountry"><option value="BR">🇧🇷 Brasil</option><option value="EUA">🇺🇸 EUA</option></select></div>
+          <div class="field"><label>Corretora (opcional)</label><input id="iBroker" placeholder="Ex.: Avenue, Sicredi…"></div>
+          <button class="btn" id="iAdd">+ Adicionar posição</button>
+        </div>
+      </div>
+
+      ${series.length>1 ? `<div class="card" style="margin-bottom:16px"><h3>📈 Evolução do patrimônio</h3>${wealthLineChart(series)}</div>` : ''}
+
+      ${totalByGroup.map(g=> g.ps.length? `<div style="margin-bottom:8px">
+        <div class="k" style="margin:18px 0 8px">${g.label}</div>
+        ${g.ps.map(invPositionCard).join('')}
+      </div>` : '').join('')}
+
+      ${!State.investments.length ? `<div class="card"><div class="empty"><div class="big">📊</div>Nenhuma posição cadastrada ainda. Comecem pelo que já existe hoje — Avenue, Tesouro Direto, CDB, LCI/LCA…</div></div>` : ''}
+    `;
+
+    const ia=sec.querySelector('#iAdd'); if(ia) ia.onclick=addInvestment;
+    const rr=sec.querySelector('#refreshRate'); if(rr) rr.onclick=()=>refreshUsdRate();
+    sec.querySelectorAll('[data-invdel]').forEach(b=> b.onclick=()=>delInvestment(b.dataset.invdel));
+    sec.querySelectorAll('[data-invsnap]').forEach(b=> b.onclick=()=>addSnapshot(b.dataset.invsnap));
+    sec.querySelectorAll('[data-snapdel]').forEach(b=> b.onclick=()=>delSnapshot(b.dataset.snapdel));
+  }
+
+  function addInvestment(){
+    const g=id=>document.getElementById(id);
+    const name=g('iName').value.trim();
+    if(!name){ g('iName').focus(); return; }
+    const cat=g('iCat').value, country=g('iCountry').value, broker=g('iBroker').value.trim();
+    const currency = country==='EUA' ? 'USD' : 'BRL';
+    State.investments.push({ id:uid(), name, cat, country, broker, currency });
+    save('investments', State.investments);
+    renderPatrimonio();
+  }
+
+  function delInvestment(posId){
+    const p = State.investments.find(x=>x.id===posId); if(!p) return;
+    if(!confirm(`Remover "${p.name}" e todo o histórico de lançamentos dela?`)) return;
+    State.investments = State.investments.filter(x=>x.id!==posId);
+    State.invSnapshots = State.invSnapshots.filter(s=>s.posId!==posId);
+    save('investments', State.investments); save('invSnapshots', State.invSnapshots);
+    renderPatrimonio();
+  }
+
+  function addSnapshot(posId){
+    const p = State.investments.find(x=>x.id===posId); if(!p) return;
+    const mo = document.getElementById('sMonth-'+posId).value;
+    const qEl = document.getElementById('sQty-'+posId);
+    const vEl = document.getElementById('sVal-'+posId);
+    const val = parseFloat(vEl.value);
+    if(!mo || !val || val<=0){ vEl.focus(); return; }
+    const qty = (qEl && qEl.value!=='') ? parseFloat(qEl.value) : null;
+    let rate = 1;
+    if(p.currency==='USD'){
+      const rEl = document.getElementById('sRate-'+posId);
+      rate = (rEl && parseFloat(rEl.value)>0) ? parseFloat(rEl.value) : (usdRate||1);
+    }
+    const valueBRL = p.currency==='USD' ? val*rate : val;
+    const existing = State.invSnapshots.find(s=>s.posId===posId && s.month===mo);
+    if(existing){ Object.assign(existing, {qty, value:val, rate, valueBRL}); }
+    else { State.invSnapshots.push({ id:uid(), posId, month:mo, qty, value:val, rate, valueBRL }); }
+    save('invSnapshots', State.invSnapshots);
+    renderPatrimonio();
+  }
+
+  function delSnapshot(id){
+    State.invSnapshots = State.invSnapshots.filter(s=>s.id!==id);
+    save('invSnapshots', State.invSnapshots);
+    renderPatrimonio();
+  }
 
   /* ===================== PANORAMA ANUAL ===================== */
   const MESES3 = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"];
@@ -1223,7 +1481,29 @@
     ["NetFlix",          ["netflix"]]
   ];
 
+  // Normaliza a descrição de um lançamento pra virar chave do dicionário de comerciantes:
+  // minúsculas, sem acento, sem números (código de loja/filial), sem pontuação.
+  // "Posto Darolt 04" e "POSTO DAROLT 12" viram os dois "posto darolt".
+  function normMerchant(desc){
+    let s = (desc||'').toLowerCase();
+    s = s.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+    s = s.replace(/\d+/g,' ');
+    s = s.replace(/[^a-z\s]/g,' ');
+    s = s.replace(/\s+/g,' ').trim();
+    return s;
+  }
+  // Grava/atualiza a categoria aprendida para esse comerciante — chamado sempre que uma
+  // transação é confirmada (importação) ou editada manualmente. É o que faz o sistema
+  // parar de pedir a mesma correção todo mês.
+  function learnMerchant(desc, cat){
+    if(!cat || cat==='A revisar') return;
+    const k = normMerchant(desc);
+    if(!k) return;
+    if(State.merchantMap[k]!==cat){ State.merchantMap[k]=cat; save('merchantMap', State.merchantMap); }
+  }
   function categorize(desc){
+    const norm = normMerchant(desc);
+    if(norm && State.merchantMap && State.merchantMap[norm]) return [State.merchantMap[norm], true];
     const d = (desc||"").toLowerCase();
     for(const [cat,kws] of RULES){ for(const kw of kws){ if(d.includes(kw)) return [cat,true]; } }
     return ["A revisar", false];
@@ -1233,22 +1513,11 @@
 
   function normNum(s){
     if(s==null) return null;
-    if(typeof s === 'number') return isNaN(s)?null:s;
     let x = String(s).replace(/[R$\s\u00a0]/g,"").replace(/[\u2212\u2013\u2014]/g,"-");
-    if(!x) return null;
-    let sign = 1;
-    // (1.234,00) = negativo (padrão contábil de alguns bancos)
-    if(/^\(.*\)$/.test(x)){ sign = -1; x = x.slice(1,-1); }
-    // sufixo D/C usado por alguns extratos brasileiros: 1.234,00 D = débito
-    const dc = x.match(/^(.*?)([DCdc])$/);
-    if(dc && /\d/.test(dc[1])){ if(dc[2].toUpperCase()==='D') sign = -1; x = dc[1]; }
     if(/,\d{1,2}$/.test(x)) x = x.replace(/\./g,"").replace(",",".");  // 1.397,00 -> 1397.00
     else x = x.replace(/,/g,"");                                       // 1,397.00 -> 1397.00
-    // SEGURANÇA: só aceita string que seja um número inteiro. parseFloat("1c7dba05") devolve 1,
-    // o que fazia códigos de documento virarem valores. Nunca mais.
-    if(!/^[+-]?\d+(\.\d+)?$/.test(x)) return null;
     const v = parseFloat(x);
-    return isNaN(v)?null:v*sign;
+    return isNaN(v)?null:v;
   }
   function normDate(s, fbYear){
     s = String(s||"").trim();
@@ -1285,100 +1554,31 @@
     res.push(cur); return res.map(s=>s.trim());
   }
 
-  // Descobre o separador testando ; , tab e | — vence o que produzir o nº de colunas mais CONSISTENTE.
-  // (Contar só a 1ª linha falhava em extratos cujo topo é cabeçalho institucional de uma coluna só.)
-  function detectDelim(lines){
-    const cands = [";", ",", "\t", "|"];
-    let best = ";", bestFreq = -1, bestN = 0;
-    cands.forEach(d=>{
-      const counts = {};
-      lines.slice(0,60).forEach(l=>{ const n = splitCSV(l,d).length; if(n>=2) counts[n]=(counts[n]||0)+1; });
-      for(const n in counts){
-        if(counts[n] > bestFreq || (counts[n]===bestFreq && +n > bestN)){ bestFreq=counts[n]; bestN=+n; best=d; }
-      }
-    });
-    return best;
-  }
-
-  // guarda o que o parser entendeu do arquivo, para mostrar na tela antes de importar
-  let lastParseInfo = null;
-
-  // Parser de CSV/planilha (fatura ou extrato)
+  // Parser de CSV (fatura ou extrato)
   function parseCSV(text, year){
-    lastParseInfo = null;
     const lines = text.split(/\r?\n/).filter(l=>l.trim());
     if(!lines.length) return [];
-    const delim = detectDelim(lines);
+    const delim = (lines[0].split(";").length > lines[0].split(",").length) ? ";" : ",";
     const rows = lines.map(l=>splitCSV(l, delim));
-
-    // Procura a linha de cabeçalho em QUALQUER posição das 40 primeiras linhas.
-    // Extratos de banco (Sicredi, Itaú, BB...) começam com nome do associado, conta, período etc.
-    // Antes o código assumia que a linha 1 era o cabeçalho: com isso ele lia a coluna "Documento"
-    // como se fosse "Valor" e transformava nº de documento em dinheiro.
-    const RX_DATE = /(^|\s)(data|date|dt\b)/;
-    const RX_VAL  = /valor|amount|value|quantia|montante|cr[eé]dito|d[eé]bito/;
-    const RX_DESC = /descri|hist[oó]|lan[çc]|estabelec|t[ií]tulo|title|memo|detalhe|opera[çc]/;
-    let hdr=-1, di=-1, vi=-1, ti=-1;
-    for(let r=0; r<Math.min(rows.length,40); r++){
-      const h = rows[r].map(x=>String(x||"").toLowerCase().trim());
-      let d=-1,v=-1,t=-1;
-      h.forEach((x,i)=>{
-        if(!x) return;
-        if(d<0 && RX_DATE.test(x) && !/saldo/.test(x)) d=i;
-        // "Saldo (R$)" NUNCA pode ser lido como valor do lançamento
-        if(v<0 && RX_VAL.test(x) && !/saldo/.test(x)) v=i;
-        if(t<0 && RX_DESC.test(x)) t=i;
-      });
-      if(d>=0 && v>=0){ hdr=r; di=d; vi=v; ti=(t>=0?t:(d===0?1:0)); break; }
-    }
-
+    let h = rows[0].map(x=>x.toLowerCase());
+    let di=-1, vi=-1, ti=-1;
+    h.forEach((x,i)=>{
+      if(di<0 && /data|date/.test(x)) di=i;
+      if(vi<0 && /valor|amount|value|quantia/.test(x)) vi=i;
+      if(ti<0 && /desc|title|hist|lan|estabelec|t.tulo/.test(x)) ti=i;
+    });
+    let start=0;
+    if(di>=0||vi>=0||ti>=0){ start=1; if(di<0)di=0; if(ti<0)ti=(di===1?0:1); if(vi<0)vi=rows[0].length-1; }
+    else { di=0; ti=1; vi=2; }
     const out=[];
-    const info = {delim: (delim==="\t"?"TAB":delim), header:null, cols:null, mode:null, skipped:0};
-
-    if(hdr>=0){
-      info.header = rows[hdr];
-      info.cols = {data: rows[hdr][di]||('col '+(di+1)), desc: rows[hdr][ti]||('col '+(ti+1)), valor: rows[hdr][vi]||('col '+(vi+1))};
-      info.mode = 'cabeçalho';
-      for(let r=hdr+1;r<rows.length;r++){
-        const row=rows[r]; if(row.length<2) continue;
-        const date=normDate(row[di], year);
-        const val=normNum(row[vi]);
-        const desc=(row[ti]||"").replace(/^"|"$/g,"").trim();
-        if(date==null || val==null){ if(row.join("").trim()) info.skipped++; continue; }
-        if(/saldo\s*(anterior|inicial|do dia|final)/i.test(desc)) continue;
-        out.push({date, desc, raw:val});
-      }
-    } else {
-      // Sem cabeçalho reconhecível: deduz linha a linha.
-      // Data = 1ª célula que é data. Valor = 1º número DEPOIS da descrição (em extratos, Valor vem antes de Saldo).
-      info.mode = 'dedução por linha (sem cabeçalho reconhecido)';
-      rows.forEach(row=>{
-        if(row.length<2) return;
-        let date=null, dIdx=-1;
-        // a célula precisa ser SÓ uma data. Sem isso, uma linha de fatura colada como texto
-        // ("28 ABR Bistek Supermercados R$ 220,16") era lida como coluna de data e virava lixo.
-        for(let i=0;i<row.length;i++){
-          const c=String(row[i]||"").trim();
-          if(!c || c.length>12) continue;
-          const d=normDate(c, year); if(d){ date=d; dIdx=i; break; }
-        }
-        if(!date) return;
-        let desc="", tIdx=-1;
-        for(let i=0;i<row.length;i++){
-          if(i===dIdx) continue;
-          const c=String(row[i]||"").trim();
-          if(c.length>desc.length && normNum(c)==null && normDate(c,year)==null){ desc=c; tIdx=i; }
-        }
-        let val=null;
-        for(let i=Math.max(dIdx,tIdx)+1;i<row.length;i++){ const v=normNum(row[i]); if(v!=null){ val=v; break; } }
-        if(val==null) for(let i=0;i<row.length;i++){ if(i===dIdx||i===tIdx) continue; const v=normNum(row[i]); if(v!=null){ val=v; break; } }
-        if(val==null || !desc) return;
-        if(/saldo\s*(anterior|inicial|do dia|final)/i.test(desc)) return;
-        out.push({date, desc, raw:val});
-      });
+    for(let r=start;r<rows.length;r++){
+      const row=rows[r]; if(row.length<2) continue;
+      const date=normDate(row[di], year);
+      const val=normNum(row[vi]);
+      const desc=(row[ti]||"").replace(/^"|"$/g,"").trim();
+      if(date==null || val==null) continue;
+      out.push({date, desc, raw:val});
     }
-    info.read = out.length;
-    lastParseInfo = out.length ? info : null;  // se nada foi lido, o fallback de texto assume — não mostra painel enganoso
     return out;
   }
 
@@ -1446,32 +1646,6 @@
   let importMsg = "";
   let lastImportCompMode = null; // 'auto'|'fixed'|'real' — usado para sincronizar a lente após importar
   let importExpectedTotal = null; // valor total da fatura digitado pelo usuário, para conferência de segurança
-  // o formulário precisa lembrar das escolhas: renderImport() reconstrói a tela e antes zerava
-  // "Origem"/"Competência" toda vez que você clicava em Analisar.
-  const impForm = { source:'card', year:String(new Date().getFullYear()), compMode:'auto', comp:null, who:'ambos', text:'' };
-
-  // SheetJS carregado sob demanda, só quando você escolhe um .xls/.xlsx
-  function loadSheetJS(){
-    if(window.XLSX) return Promise.resolve(window.XLSX);
-    if(window.__xlsxP) return window.__xlsxP;
-    window.__xlsxP = new Promise((res,rej)=>{
-      const s=document.createElement('script');
-      s.src='https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
-      s.onload=()=>window.XLSX?res(window.XLSX):rej(new Error('lib'));
-      s.onerror=()=>rej(new Error('rede'));
-      document.head.appendChild(s);
-    });
-    return window.__xlsxP;
-  }
-
-  // Converte a 1ª planilha em texto delimitado por ; preservando as células como texto
-  function sheetToText(ab){
-    const wb = window.XLSX.read(ab, {type:'array', cellDates:true, raw:false});
-    const ws = wb.Sheets[wb.SheetNames[0]];
-    return window.XLSX.utils.sheet_to_csv(ws, {FS:';', dateNF:'dd/mm/yyyy', blankrows:false});
-  }
-
-  function setImpMsg(m){ importMsg=m; const el=document.getElementById('impMsg'); if(el) el.textContent=m; }
 
   function renderImport(){
     const sec = document.getElementById('sec-import');
@@ -1498,45 +1672,38 @@
         <div class="formrow" style="margin-bottom:12px">
           <div class="field" style="flex:0 0 200px"><label>Origem</label>
             <select id="impSource">
-              <option value="card" ${impForm.source==='card'?'selected':''}>Cartão de crédito (fatura)</option>
-              <option value="account" ${impForm.source==='account'?'selected':''}>Conta / extrato bancário</option>
+              <option value="card">Cartão de crédito (fatura)</option>
+              <option value="account">Conta / extrato bancário</option>
             </select></div>
           <div class="field" style="flex:0 0 130px"><label>Ano de referência</label>
-            <input id="impYear" type="number" value="${esc(impForm.year)}" min="2020" max="2099"></div>
+            <input id="impYear" type="number" value="2026" min="2020" max="2099"></div>
           <div class="field" style="flex:0 0 250px"><label>Competência (quando entra)</label>
             <select id="impCompMode">
-              <option value="auto" ${impForm.compMode==='auto'?'selected':''}>Automática — mês de pagamento da fatura</option>
-              <option value="fixed" ${impForm.compMode==='fixed'?'selected':''}>Mês fixo (escolho ao lado)</option>
-              <option value="real" ${impForm.compMode==='real'?'selected':''}>Data real de cada compra</option>
+              <option value="auto">Automática — mês de pagamento da fatura</option>
+              <option value="fixed">Mês fixo (escolho ao lado)</option>
+              <option value="real">Data real de cada compra</option>
             </select></div>
           <div class="field" style="flex:0 0 150px"><label>Mês fixo</label>
-            <input id="impComp" type="month" value="${impForm.comp||month}"></div>
+            <input id="impComp" type="month" value="${month}"></div>
           <div class="field" style="flex:0 0 150px"><label>Lançar como</label>
-            <select id="impWho"><option value="ambos" ${impForm.who==='ambos'?'selected':''}>Ambos</option><option value="a" ${impForm.who==='a'?'selected':''}>${esc(State.profile.a)}</option><option value="b" ${impForm.who==='b'?'selected':''}>${esc(State.profile.b)}</option></select></div>
+            <select id="impWho"><option value="ambos">Ambos</option><option value="a">${esc(State.profile.a)}</option><option value="b">${esc(State.profile.b)}</option></select></div>
           <div class="field" style="flex:0 0 180px"><label>Valor total da fatura (conferência)</label>
             <input id="impExpTotal" type="number" min="0" step="0.01" placeholder="opcional" value="${importExpectedTotal!=null?importExpectedTotal:''}"></div>
-          <div class="field" style="flex:0 0 auto"><label>Arquivo do banco (Excel ou CSV)</label>
-            <input id="impFile" type="file" accept=".csv,.txt,.xls,.xlsx,.xlsm"></div>
+          <div class="field" style="flex:0 0 auto"><label>Arquivo CSV (opcional)</label>
+            <input id="impFile" type="file" accept=".csv,.txt"></div>
         </div>
         <div class="desc" style="margin:0 0 12px"><b>Automática</b>: a fatura inteira entra no mês em que você a paga (mês das compras + 1). Ex.: fatura de compras de junho → você paga em julho → tudo entra em <b>julho</b>. Para extrato bancário, use “Data real”.</div>
         <div class="desc" style="margin:0 0 12px">💳 Itens vindos de <b>Cartão de crédito (fatura)</b> entram no grupo <b>Compras no cartão</b>. Itens vindos de <b>Conta / extrato bancário</b> (dinheiro, Pix, débito automático, cartão de débito) <b>não</b> entram nesse grupo — ficam em Lançamentos do mês, sempre como <b>A revisar</b>. Você pode corrigir a forma de pagamento de qualquer item depois, clicando em ✎ editar.</div>
         <div class="field" style="margin-bottom:12px">
           <label>Ou cole aqui o conteúdo (linhas da fatura ou CSV)</label>
           <textarea id="impText" rows="6" placeholder="Ex.:&#10;28 ABR Bistek Supermercados R$ 220,16&#10;05 MAI Auto Posto Darolt R$ 244,32&#10;&#10;...ou cole o CSV exportado do app do banco." 
-            style="font-family:var(--body);font-size:13.5px;color:var(--ink);background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:11px 12px;width:100%;resize:vertical">${esc(impForm.text||'')}</textarea>
+            style="font-family:var(--body);font-size:13.5px;color:var(--ink);background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:11px 12px;width:100%;resize:vertical"></textarea>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
           <button class="btn" id="impAnalyze">Analisar e categorizar</button>
           ${pending?`<button class="btn ghost" id="impClear">Limpar</button>`:''}
-          <span id="impMsg" style="font-size:13px;color:var(--ink-soft)">${esc(importMsg)}</span>
+          <span style="font-size:13px;color:var(--ink-soft)">${importMsg}</span>
         </div>
-        ${lastParseInfo? `<div class="desc" style="margin:12px 0 0;padding:10px 12px;border:1px dashed var(--line);border-radius:10px">
-          🔍 <b>Como li o arquivo</b> — confira antes de importar:
-          ${lastParseInfo.cols? `Data = <b>${esc(lastParseInfo.cols.data)}</b> · Descrição = <b>${esc(lastParseInfo.cols.desc)}</b> · Valor = <b>${esc(lastParseInfo.cols.valor)}</b>`
-            : `sem cabeçalho reconhecido — colunas deduzidas linha a linha`}
-          · separador <b>${esc(lastParseInfo.delim)}</b> · <b>${lastParseInfo.read}</b> linha(s) lida(s)${lastParseInfo.skipped?` · ${lastParseInfo.skipped} linha(s) ignorada(s) por não ter data ou valor válido`:''}.
-          ${lastParseInfo.cols && /saldo|documento/i.test(lastParseInfo.cols.valor)? `<br><b style="color:var(--coral)">⚠ A coluna de valor parece errada. Não importe.</b>`:''}
-        </div>`:''}
       </div>
 
       ${pending? `
@@ -1591,41 +1758,13 @@
     // wiring
     sec.querySelector('#impAnalyze').onclick = doAnalyze;
     const srcEl = sec.querySelector('#impSource');
-    if(srcEl) srcEl.onchange = ()=>{
-      impForm.source = srcEl.value;
-      const m=sec.querySelector('#impCompMode');
-      if(m){ m.value = (srcEl.value==='account')?'real':'auto'; impForm.compMode = m.value; }
-    };
-    const bind=(id,key)=>{ const el=sec.querySelector(id); if(el) el.onchange=()=>{ impForm[key]=el.value; }; };
-    bind('#impYear','year'); bind('#impCompMode','compMode'); bind('#impComp','comp'); bind('#impWho','who');
-    const taEl = sec.querySelector('#impText');
-    if(taEl) taEl.oninput = ()=>{ impForm.text = taEl.value; };
-
+    if(srcEl) srcEl.onchange = ()=>{ const m=sec.querySelector('#impCompMode'); if(m) m.value = (srcEl.value==='account')?'real':'auto'; };
     const fileEl = sec.querySelector('#impFile');
     if(fileEl) fileEl.onchange = (e)=>{
       const f=e.target.files[0]; if(!f) return;
-      const ta = sec.querySelector('#impText');
-      const isXls = /\.(xls|xlsx|xlsm)$/i.test(f.name||'');
-      if(isXls){
-        setImpMsg('Lendo planilha do banco...');
-        const rd=new FileReader();
-        rd.onload=()=>{
-          loadSheetJS().then(()=>{
-            try{
-              const txt = sheetToText(new Uint8Array(rd.result));
-              if(ta) ta.value = txt; impForm.text = txt;
-              setImpMsg('Planilha lida (' + f.name + '). Clique em "Analisar e categorizar".');
-            }catch(err){ setImpMsg('Não consegui ler esta planilha. Salve como CSV e tente de novo.'); }
-          }).catch(()=> setImpMsg('Sem conexão para ler Excel. Salve o arquivo como CSV e use o mesmo campo.'));
-        };
-        rd.readAsArrayBuffer(f);
-      } else {
-        const rd=new FileReader();
-        rd.onload=()=>{ if(ta) ta.value = rd.result; impForm.text = String(rd.result||''); setImpMsg('Arquivo lido. Clique em "Analisar e categorizar".'); };
-        rd.readAsText(f);
-      }
+      const rd=new FileReader(); rd.onload=()=>{ sec.querySelector('#impText').value = rd.result; }; rd.readAsText(f);
     };
-    if(sec.querySelector('#impClear')) sec.querySelector('#impClear').onclick=()=>{ importRows=[]; importMsg=""; importExpectedTotal=null; lastParseInfo=null; impForm.text=''; renderImport(); };
+    if(sec.querySelector('#impClear')) sec.querySelector('#impClear').onclick=()=>{ importRows=[]; importMsg=""; importExpectedTotal=null; renderImport(); };
     sec.querySelectorAll('.impInc').forEach(c=> c.onchange=()=>{ const r=importRows.find(x=>x._id===c.dataset.id); r.include=c.checked; renderImport(); });
     sec.querySelectorAll('.impCat').forEach(s=> s.onchange=()=>{ const r=importRows.find(x=>x._id===s.dataset.id); r.cat=s.value; });
     sec.querySelectorAll('.impParc').forEach(c=> c.onchange=()=>{ const r=importRows.find(x=>x._id===c.dataset.id); if(r) r.trackDebt=c.checked; });
@@ -1643,8 +1782,6 @@
     const compOpt={mode, fixed};
     lastImportCompMode = mode;
     const text=sec.querySelector('#impText').value.trim();
-    impForm.source=source; impForm.year=year; impForm.compMode=mode; impForm.comp=fixed;
-    impForm.who=sec.querySelector('#impWho').value; impForm.text=sec.querySelector('#impText').value;
     if(!text){ importMsg="Cole o conteúdo ou selecione um arquivo primeiro."; renderImport(); return; }
     let items = parseCSV(text, year);
     if(items.length===0) items = parseFaturaText(text, year);  // fallback texto
@@ -1663,6 +1800,7 @@
       // origem "Conta / extrato bancário" = pago em dinheiro/Pix/débito — não deve entrar nesse grupo.
       State.tx.push({ id:uid(), type:r.type, amount:r.amount, cat:r.cat, who:r.who||"ambos", date:r.date, desc:r.desc, comp:r.comp||undefined,
         imp:true, source:r.source, card:(r.source==='account'?false:undefined) });
+      if(r.type==='out') learnMerchant(r.desc, r.cat);
     });
     save('tx', State.tx);
     const n=add.length;
@@ -1681,7 +1819,7 @@
     save('lens', lens);
     updateLensChips();
 
-    importRows=[]; importMsg=""; importExpectedTotal=null; lastParseInfo=null; impForm.text='';
+    importRows=[]; importMsg=""; importExpectedTotal=null;
     month = target; document.getElementById('mLabel').textContent = monthLabel(month);
     renderLensHint();
     renderAll();
@@ -2089,6 +2227,7 @@
   const SEED_FIXED = [{"name": "Dízimo", "amount": 2000.0, "cat": "Dízimo", "who": "ambos"}, {"name": "Condomínio", "amount": 429.66, "cat": "Moradia", "who": "ambos"}, {"name": "Plano Saúde", "amount": 1562.21, "cat": "Saúde", "who": "ambos"}, {"name": "Escola crianças", "amount": 1689.02, "cat": "Escola", "who": "ambos"}, {"name": "Energia (casa)", "amount": 34.65, "cat": "Moradia", "who": "ambos"}, {"name": "Celular Thi", "amount": 44.0, "cat": "Celular", "who": "a"}, {"name": "Claro", "amount": 51.6, "cat": "Celular", "who": "ambos"}, {"name": "Spotify", "amount": 23.9, "cat": "Assinaturas", "who": "ambos"}, {"name": "Fut Pedro (Denis)", "amount": 150.0, "cat": "Academia", "who": "ambos"}, {"name": "Anuidade cartão", "amount": 34.99, "cat": "Serviços", "who": "ambos"}, {"name": "Aluguel Garagem (Fusca)", "amount": 170.0, "cat": "Moradia", "who": "ambos"}, {"name": "Plano Capital", "amount": 20.0, "cat": "Saúde", "who": "ambos"}, {"name": "Cesta relacionamento", "amount": 14.0, "cat": "Outros", "who": "ambos"}, {"name": "Energia terreno", "amount": 146.62, "cat": "Casa Sitio", "who": "ambos"}, {"name": "Água terreno", "amount": 134.38, "cat": "Casa Sitio", "who": "ambos"}, {"name": "CFAN", "amount": 30.0, "cat": "Outros", "who": "ambos"}, {"name": "Internet terreno", "amount": 99.9, "cat": "Casa Sitio", "who": "ambos"}, {"name": "Amazon Prime", "amount": 29.9, "cat": "Assinaturas", "who": "ambos"}];
   /* ---------- init ---------- */
   (async function init(){
+   try{
     State.profile = await load('profile', State.profile);
     const seeded = await load('seeded_nubank_jun26', false);
     if(!seeded){
@@ -2117,6 +2256,9 @@
       await save('mig_comp_jun26', true);
     }
     State.fixed = await load('fixed', []);
+    State.investments   = await load('investments', []);
+    State.invSnapshots  = await load('invSnapshots', []);
+    State.merchantMap   = await load('merchantMap', {});
     lens = await load('lens', 'competencia');
     const sc = await load('cats', null);
     if(sc && sc.out && sc.in){ CAT_OUT = sc.out; CAT_IN = sc.in; }
@@ -2144,9 +2286,29 @@
       if(changed) await save('tx', State.tx);
       await save('mig_imp_retro_jul26', true);
     }
+    // migração: semeia o dicionário de comerciantes (merchantMap) com o histórico já existente,
+    // pra a categorização automática já nascer aprendida, em vez de começar do zero.
+    const migMerchant = await load('mig_merchant_v1', false);
+    if(!migMerchant){
+      const freq = {};
+      State.tx.forEach(t=>{
+        if(t.type!=='out' || !t.cat || t.cat==='A revisar') return;
+        const k = normMerchant(t.desc); if(!k) return;
+        freq[k] = freq[k] || {}; freq[k][t.cat] = (freq[k][t.cat]||0)+1;
+      });
+      Object.keys(freq).forEach(k=>{
+        const best = Object.entries(freq[k]).sort((a,b)=>b[1]-a[1])[0];
+        if(best) State.merchantMap[k] = best[0];
+      });
+      await save('merchantMap', State.merchantMap);
+      await save('mig_merchant_v1', true);
+    }
     month = ymNow(); // abre sempre no mês atual
     yearSel = month.slice(0,4);
     shell();
+   }catch(e){
+    showFatalStorageError(e);
+   }
   })();
 })();
 </script>
