@@ -170,7 +170,8 @@
   .chip.on{background:var(--forest);color:#fff;border-color:var(--forest)}
 
   .donutwrap{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
-  .legend{display:flex;flex-direction:column;gap:7px;font-size:13px;flex:1;min-width:150px}
+  .catrow summary::-webkit-details-marker{display:none}
+  .legend{display:flex;flex-direction:column;gap:7px;font-size:13px;flex:1;min-width:150px;max-height:300px;overflow-y:auto;padding-right:4px}
   .legend .li{display:flex;align-items:center;gap:8px;cursor:pointer;border-radius:8px;padding:3px 4px;margin:-3px -4px;transition:background .12s}
   .legend .li:hover{background:var(--paper-2)}
   .legend .sw{width:11px;height:11px;border-radius:3px;flex:none}
@@ -546,7 +547,8 @@
       <div id="lensHint" style="font-size:12.5px;color:var(--ink-soft);margin-bottom:20px"></div>
 
       <nav class="tabs" id="tabs">
-        <button data-tab="dash" class="active">Visão geral</button>
+        <button data-tab="cats" class="active">Gastos</button>
+        <button data-tab="dash">Visão geral</button>
         <button data-tab="budget">Orçamento</button>
         <button data-tab="fixed">Fixas</button>
         <button data-tab="tx">Lançamentos</button>
@@ -558,7 +560,8 @@
         <button data-tab="import">Importar</button>
       </nav>
 
-      <section id="sec-dash" class="show"></section>
+      <section id="sec-cats" class="show"></section>
+      <section id="sec-dash"></section>
       <section id="sec-tx"></section>
       <section id="sec-budget"></section>
       <section id="sec-goals"></section>
@@ -642,7 +645,71 @@
     renderAll();
   }
 
-  function renderAll(){ renderDash(); renderTx(); renderBudget(); renderGoals(); renderDebts(); renderImport(); renderAnalysis(); renderFixed(); renderYear(); renderPatrimonio(); }
+  function renderAll(){ renderCats(); renderDash(); renderTx(); renderBudget(); renderGoals(); renderDebts(); renderImport(); renderAnalysis(); renderFixed(); renderYear(); renderPatrimonio(); }
+
+
+  /* ---------- GASTOS POR CATEGORIA (tela simples, sempre pela DATA DA COMPRA) ---------- */
+  // Categorias pagas pelo ESPÓLIO (não pelo caixa da família): aparecem num bloco à parte e NÃO entram no total do mês.
+  const ESPOLIO_CATS = ["Partilha Herança"];
+  function renderCats(){
+    const sec=document.getElementById('sec-cats'); if(!sec) return;
+    const prevYM = (()=>{ let [y,m]=month.split('-').map(Number); m--; if(m<1){m=12;y--;} return y+'-'+String(m).padStart(2,'0'); })();
+    const outOf = ym => State.tx.filter(t=> t.type==='out' && purchaseYM(t)===ym);
+    const all = outOf(month);
+    const isEsp = t => ESPOLIO_CATS.indexOf(t.cat)>=0;
+    const list = all.filter(t=>!isEsp(t));
+    const espList = all.filter(isEsp);
+    const prevBy={}; outOf(prevYM).filter(t=>!isEsp(t)).forEach(t=>{ prevBy[t.cat]=(prevBy[t.cat]||0)+t.amount; });
+    const group = arr => { const by={}; arr.forEach(t=>{ const c = by[t.cat] || (by[t.cat]={cat:t.cat,total:0,card:0,items:[]}); c.total+=t.amount; if(isCardTx(t)) c.card+=t.amount; c.items.push(t); }); return Object.values(by).sort((a,b)=>b.total-a.total); };
+    const rows = group(list), espRows = group(espList);
+    const total = sum(rows.map(r=>r.total));
+    const totalCard = sum(rows.map(r=>r.card));
+    const espTotal = sum(espRows.map(r=>r.total));
+    const cardCount = list.filter(isCardTx).length;
+    const max = rows.length? rows[0].total : 1;
+
+    const warn = (!cardCount) ? `<div class="activefilter" style="background:var(--gold-soft);margin-bottom:14px">⚠️ Não há nenhuma compra de <b>cartão</b> em ${monthLabel(month)} neste painel. Se vocês usaram o cartão, importem a fatura aberta na aba <b>Importar</b> — senão os totais abaixo ficam incompletos.</div>` : '';
+
+    const rowHtml = (r,i,showPrev) => {
+      const pct = total>0 && showPrev ? Math.round(r.total/total*100) : null;
+      const prev = showPrev ? prevBy[r.cat] : null;
+      const items = r.items.slice().sort((a,b)=>(b.date||'').localeCompare(a.date||''));
+      return `<details class="catrow" style="border-bottom:1px solid var(--line);padding:4px 0">
+        <summary style="list-style:none;cursor:pointer;padding:10px 4px">
+          <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px">
+            <span style="font-weight:600;font-size:15px">${CAT_ICON[r.cat]||'•'} ${esc(r.cat)} ${r.cat==='A revisar'?'<span class="tag" style="background:var(--coral-soft);color:var(--coral)">sem categoria</span>':''}</span>
+            <span style="font-family:var(--display);font-weight:600;font-size:18px;font-variant-numeric:tabular-nums">${fmt(r.total)}</span>
+          </div>
+          ${showPrev?`<div class="bar" style="margin:7px 0 4px"><span style="width:${(r.total/max*100).toFixed(1)}%;background:${PALETTE[i%PALETTE.length]}"></span></div>`:''}
+          <div style="font-size:12.5px;color:var(--ink-soft)">${pct!=null?pct+'% do total · ':''}${r.items.length} lançamento(s)${r.card>0?` · cartão ${fmt(r.card)}`:''}${prev!=null?` · mês anterior ${fmt(prev)}`:''}</div>
+        </summary>
+        <div class="list" style="padding:0 4px 10px">
+          ${items.map(t=>{ const d=new Date(t.date+'T00:00'); const ds=isNaN(d)?'':d.toLocaleDateString('pt-BR',{day:'2-digit',month:'short'});
+            return `<div class="row" style="padding:8px 0"><div class="meta"><div class="t">${esc(t.desc||t.cat)}</div><div class="s">${ds} · ${isCardTx(t)?'💳 cartão':'💵 dinheiro/pix'}${t.who==='a'?' · '+esc(State.profile.a):t.who==='b'?' · '+esc(State.profile.b):''}</div></div><div class="amt out">− ${fmtShort(t.amount)}</div></div>`; }).join('')}
+          <div class="row" style="font-weight:700"><div class="meta"><div class="t">Total ${esc(r.cat)}</div></div><div class="amt out">${fmt(r.total)}</div></div>
+        </div>
+      </details>`;
+    };
+
+    sec.innerHTML = `
+      <div class="sectionhead">
+        <div><div class="lead">Quanto gastamos em ${monthLabel(month)}</div>
+        <div class="desc">Gastos da família no mês, por categoria — cartão, pix, dinheiro e fixas juntos, contados pela data da compra. Toque numa categoria para ver cada lançamento.</div></div>
+      </div>
+      ${warn}
+      <div class="card stat accent" style="margin-bottom:16px">
+        <div class="k">Total gasto pela família no mês</div><div class="v">${fmt(total)}</div>
+        <div class="hint">${list.length} lançamento(s) · no cartão ${fmt(totalCard)} · fora do cartão ${fmt(total-totalCard)}</div>
+      </div>
+      <div class="card">
+        ${rows.length? rows.map((r,i)=>rowHtml(r,i,true)).join('') : `<div class="empty"><div class="big">🌱</div>Nenhum gasto registrado em ${monthLabel(month)}.</div>`}
+      </div>
+      ${espRows.length? `<div class="card" style="margin-top:16px">
+        <h3>🏛️ Pago pelo espólio — ${fmt(espTotal)}</h3>
+        <div class="desc" style="margin-bottom:6px">Saiu do dinheiro da herança, não do caixa da família. Por isso <b>não entra</b> no total acima.</div>
+        ${espRows.map((r,i)=>rowHtml(r,i,false)).join('')}
+      </div>` : ''}`;
+  }
 
   /* ---------- DASHBOARD ---------- */
   function renderDash(){
@@ -725,9 +792,9 @@
         stroke-width="${sw}" stroke-dasharray="${C}" stroke-dashoffset="${off}"
         transform="rotate(${rot} ${cx} ${cy})" stroke-linecap="butt" ${clickable?`class="donutseg" data-cat="${esc(cat)}"`:''}><title>${esc(cat)}</title></circle>`;
     });
-    const legend = cats.slice(0,7).map(([cat,val],i)=>`
+    const legend = cats.map(([cat,val],i)=>`
       <div class="li" ${clickable?`data-cat="${esc(cat)}" title="Ver lançamentos de ${esc(cat)}"`:''}><span class="sw" style="background:${PALETTE[i%PALETTE.length]}"></span>
-      <span class="lt">${esc(cat)}</span><span class="lv">${Math.round(val/total*100)}%</span></div>`).join("");
+      <span class="lt">${esc(cat)}</span><span class="lv">${fmtShort(val)} <span style="color:var(--ink-soft);font-weight:500">· ${Math.round(val/total*100)}%</span></span></div>`).join("");
     return `<div class="donutwrap">
       <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" style="flex:none">
         <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="var(--paper-2)" stroke-width="${sw}"/>
@@ -765,7 +832,7 @@
 
     // banner de filtro ativo (clicado num gráfico ou numa linha de composição)
     let filterBanner='';
-    if(txCatFilter) filterBanner=`<div class="activefilter">Mostrando lançamentos de <b>${CAT_ICON[txCatFilter]||'•'} ${esc(txCatFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
+    if(txCatFilter) filterBanner=`<div class="activefilter">Mostrando lançamentos de <b>${CAT_ICON[txCatFilter]||'•'} ${esc(txCatFilter)}</b> em ${monthLabel(month)} — total <b>${fmt(sum(list.filter(t=>t.type==='out').map(t=>t.amount)))}</b><button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
     else if(txKindFilter) filterBanner=`<div class="activefilter">Mostrando <b>${esc(KIND_LABEL[txKindFilter]||txKindFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
     else if(txBucketFilter) filterBanner=`<div class="activefilter">Mostrando <b>${BUCKET_ICON[txBucketFilter]||''} ${esc(BUCKET_LABEL[txBucketFilter]||txBucketFilter)}</b> em ${monthLabel(month)}<button class="clearf" id="clearFilt">✕ Limpar filtro</button></div>`;
 
